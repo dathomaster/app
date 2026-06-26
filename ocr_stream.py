@@ -93,6 +93,8 @@ class OCRReceiver:
         self._queue: "Queue[Reading]" = Queue(maxsize=queue_size)
         self.on_reading = None  # optional callback: fn(Reading) -> None
         self.on_gps = None      # optional callback: fn(GPSReading) -> None
+        self.on_heartbeat = None  # optional callback: fn() -> None
+        self.last_packet_time = 0.0
         # Stats so you can see how aggressive the filtering is
         self.rejected_count = 0
 
@@ -129,12 +131,22 @@ class OCRReceiver:
             except OSError:
                 break
 
+            self.last_packet_time = time.time()
+
             # A packet may contain one or more "ts\tnumber\n" lines
             for line in data.decode("utf-8", errors="ignore").splitlines():
                 line = line.strip()
                 if not line:
                     continue
                 parts = line.split("\t")
+
+                if parts and parts[0] == "HB":
+                    if self.on_heartbeat is not None:
+                        try:
+                            self.on_heartbeat()
+                        except Exception:
+                            pass
+                    continue
 
                 # GPS packet from the iPhone app:
                 # GPS\t<unix_timestamp>\t<latitude>\t<longitude>[\t<altitude_m>]

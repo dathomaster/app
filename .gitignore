@@ -1,0 +1,12 @@
+# Autosave files
+autosaves/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec

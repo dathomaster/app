@@ -18,6 +18,7 @@ import json
 import math
 import queue
 import re
+import subprocess
 import threading
 import time
 from collections import deque
@@ -43,6 +44,7 @@ from ocr_stream import OCRReceiver
 APP_DIR = Path(__file__).resolve().parent
 LOAD_CELLS_FILE = APP_DIR / "load_cells.json"
 SYNC_STATE_FILE = APP_DIR / "sync_state.json"
+OPERATOR_NAME_FILE = APP_DIR / "operator_name.txt"
 AUTOSAVE_DIR = APP_DIR / "autosaves"
 
 # Starting calibration from the current Morehouse certificate.
@@ -99,6 +101,17 @@ def load_saved_load_cells() -> list[dict]:
 
 def save_load_cells(load_cells: list[dict]) -> None:
     LOAD_CELLS_FILE.write_text(json.dumps(load_cells, indent=2), encoding="utf-8")
+
+
+def _load_operator_name() -> str:
+    try:
+        return OPERATOR_NAME_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _save_operator_name(name: str) -> None:
+    OPERATOR_NAME_FILE.write_text(name.strip(), encoding="utf-8")
 
 
 def force_from_response(response_mv_v: float, mode: str, load_cell: dict) -> float:
@@ -342,17 +355,17 @@ class HADIWorker:
 
 def load_sync_state() -> dict:
     if not SYNC_STATE_FILE.exists():
-        return {"lag_ms": 0.0, "confidence": 0.0, "manual": False, "calibration_lag_ms": 0.0}
+        return {"lag_ms": 239.0, "confidence": 0.0, "manual": False, "calibration_lag_ms": 239.0}
     try:
         data = json.loads(SYNC_STATE_FILE.read_text(encoding="utf-8"))
         return {
-            "lag_ms": float(data.get("lag_ms", 0.0)),
+            "lag_ms": float(data.get("lag_ms", 239.0)),
             "confidence": float(data.get("confidence", 0.0)),
             "manual": bool(data.get("manual", False)),
-            "calibration_lag_ms": float(data.get("calibration_lag_ms", 0.0)),
+            "calibration_lag_ms": float(data.get("calibration_lag_ms", 239.0)),
         }
     except Exception:
-        return {"lag_ms": 0.0, "confidence": 0.0, "manual": False, "calibration_lag_ms": 0.0}
+        return {"lag_ms": 239.0, "confidence": 0.0, "manual": False, "calibration_lag_ms": 239.0}
 
 
 def save_sync_state(lag_ms: float, confidence: float, manual: bool = False,
@@ -371,14 +384,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("HADI + OCR Capture")
-        self.geometry("1092x703")
+        self.geometry("1125x703")
         self.minsize(980, 650)
 
         self.load_cells = load_saved_load_cells()
-        self.selected_load_cell_name = tk.StringVar(value=self.load_cells[0]["name"])
+        self.selected_load_cell_name = tk.StringVar(value="")
 
         self.hadi = HADIWorker()
-        self.hadi.load_cell = self.load_cells[0]
         self.ocr: Optional[OCRReceiver] = None
         self.latest_hadi: Optional[HADIReading] = None
         self.latest_ocr: Optional[OCRTimedReading] = None
@@ -424,8 +436,25 @@ class App(tk.Tk):
         self.target_force_var = tk.StringVar(value="")
         self.target_forces: list[float] = []
 
+        self.auto_capture_enabled = tk.BooleanVar(value=True)
+        self.auto_capture_tolerance_var = tk.StringVar(value="1.0")
+        self.auto_capture_dwell_var = tk.StringVar(value="3.0")
+        self.auto_capture_voice_var = tk.BooleanVar(value=True)
+        self.operator_name_var = tk.StringVar(value=_load_operator_name())
+        self.operator_name_var.trace_add("write", lambda *_: _save_operator_name(self.operator_name_var.get()))
+
+        self.manual_median_enabled = tk.BooleanVar(value=True)
+        self.manual_median_window_var = tk.StringVar(value="0.5")
+        self.require_both_var = tk.BooleanVar(value=False)
+        self.ignore_sign_var = tk.BooleanVar(value=False)
+        self._auto_capture_in_range_since: Optional[float] = None
+        self._auto_capture_last_index: Optional[int] = None
+        self._auto_capture_last_run: Optional[int] = None
+
         self.latest_gps: Optional[GPSFix] = None
+        self._mf_override: Optional[float] = None
         self.gps_status_var = tk.StringVar(value="Gravity: waiting for GPS")
+        self.mf_override_var = tk.StringVar(value="")
         self.weight_status_var = tk.StringVar(value="Select rows and click SELECT / UNSELECT W")
         self.manual_weight_var = tk.StringVar(value="")
         self.weight_choice_var = tk.StringVar(value="")
@@ -451,6 +480,7 @@ class App(tk.Tk):
         self.live_error_var = tk.StringVar(value="--")
         self.hadi_last_pc_time = None
         self.ocr_last_pc_time = None
+        self._ocr_last_packet_pc = None
         self.hadi_wait_seconds = 1.5
         self.ocr_wait_seconds = 1.5
         self.ocr_age_var = tk.StringVar(value="")
@@ -487,20 +517,14 @@ class App(tk.Tk):
         self.after(700, self._auto_connect_on_launch)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind_all("<KeyPress-space>", self._capture_from_key)
-        self.bind_all("<KeyPress-Return>", self._capture_from_key)
 
-        # Tk keeps keyboard focus on the last button/table you clicked.
-        # If a button has focus, Space/Enter can activate that button instead of acting
-        # like a clean capture shortcut. These class bindings make Space/Enter always
-        # mean capture and remove sticky button focus after mouse clicks.
         self.bind_class("TButton", "<KeyPress-space>", self._capture_from_key)
-        self.bind_class("TButton", "<KeyPress-Return>", self._capture_from_key)
         self.bind_class("TButton", "<ButtonRelease-1>", self._release_button_focus, add="+")
 
     def _setup_styles(self):
         style = ttk.Style(self)
         style.configure("LiveTitle.TLabel", font=("Segoe UI", 13, "bold"))
-        style.configure("BigValue.TLabel", font=("Consolas", 34, "bold"))
+        style.configure("BigValue.TLabel", font=("Consolas", 38, "bold"))
         style.configure("ErrorValue.TLabel", font=("Consolas", 32, "bold"))
         style.configure("SmallValue.TLabel", font=("Consolas", 16))
         style.configure("TinyValue.TLabel", font=("Consolas", 9))
@@ -510,7 +534,7 @@ class App(tk.Tk):
         style.configure("OverloadBadgeHidden.TLabel", font=("Segoe UI", 11, "bold"), foreground="#c1121f", background="#c1121f", padding=(120, 6))
         style.configure("Zero.TButton", font=("Segoe UI", 9, "bold"))
         style.configure("Override.TButton", font=("Segoe UI", 10, "bold"), padding=(10, 6))
-        style.configure("BigCapture.TButton", font=("Segoe UI", 16, "bold"), padding=(18, 14))
+        style.configure("BigCapture.TButton", font=("Segoe UI", 12, "bold"), padding=(14, 8))
 
     def _build_ui(self):
         self.notebook = ttk.Notebook(self)
@@ -519,14 +543,17 @@ class App(tk.Tk):
         self.capture_tab = ttk.Frame(self.notebook)
         self.connection_tab = ttk.Frame(self.notebook)
         self.load_cells_tab = ttk.Frame(self.notebook)
+        self.converter_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.capture_tab, text="Capture")
         self.notebook.add(self.connection_tab, text="Settings")
         self.notebook.add(self.load_cells_tab, text="Load Cells")
+        self.notebook.add(self.converter_tab, text="Converter")
 
         self._build_capture_tab(self.capture_tab)
         self._build_connection_tab(self.connection_tab)
         self._build_load_cells_tab(self.load_cells_tab)
+        self._build_converter_tab(self.converter_tab)
 
     def _build_capture_tab(self, root):
         pad = {"padx": 10, "pady": 8}
@@ -555,6 +582,7 @@ class App(tk.Tk):
         decimals.grid(row=0, column=5, sticky="w", padx=(0, 12), pady=4)
         decimals.bind("<<ComboboxSelected>>", lambda _e: self._set_hadi_display_options())
 
+
         mode_bar = ttk.Frame(root)
         mode_bar.pack(fill="x", padx=10, pady=(0, 2))
         mode_bar.columnconfigure(0, weight=1)
@@ -568,8 +596,29 @@ class App(tk.Tk):
         self.mode_badge_label.grid(row=0, column=1)
         self.mode_badge_label.bind("<Button-1>", lambda _e: self._toggle_mode())
 
+        ac_frame = ttk.Frame(mode_bar)
+        ac_frame.place(relx=0.5, rely=0.5, anchor="w", x=80)
+        self._ac_indicator_frame = ac_frame
+        ttk.Label(ac_frame, text="±", font=("Segoe UI", 10)).pack(side="left")
+        ttk.Entry(ac_frame, textvariable=self.auto_capture_tolerance_var, width=5,
+                  font=("Segoe UI", 9)).pack(side="left", padx=(1, 2))
+        self._ac_units_var = tk.StringVar(value="LBF")
+        ttk.Label(ac_frame, textvariable=self._ac_units_var, font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
+        self._ac_status_label_var = tk.StringVar(value="")
+        ttk.Label(ac_frame, textvariable=self._ac_status_label_var,
+                  font=("Segoe UI", 9), foreground="#666666").pack(side="left")
+
+        self._ac_gauge = tk.Canvas(root, height=24, highlightthickness=0, bg="#e5e7eb")
+        self._ac_gauge.bind("<Configure>", lambda _e: self._redraw_ac_gauge())
+        self._ac_gauge_error = 0.0
+        self._ac_gauge_tolerance = 1.0
+        self._ac_gauge_active = False
+
         display = ttk.Frame(root)
         display.pack(fill="both", expand=True, **pad)
+        self._ac_display_frame = display
+
+        self._update_ac_indicator_visibility()
 
         left = ttk.LabelFrame(display, text="Live Display")
         left.pack(side="left", fill="both", expand=True, padx=(0, 6))
@@ -582,17 +631,22 @@ class App(tk.Tk):
         ocr_header = ttk.Frame(ocr_card)
         ocr_header.grid(row=0, column=0, sticky="ew")
         ocr_header.columnconfigure(0, weight=1)
-        ttk.Label(ocr_header, text="OCR Stream", style="LiveTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ocr_title_frame = ttk.Frame(ocr_header)
+        ocr_title_frame.grid(row=0, column=0, sticky="w")
+        ttk.Label(ocr_title_frame, text="OCR Stream", style="LiveTitle.TLabel").pack(side="left")
+        self.ocr_status_light = tk.Canvas(ocr_title_frame, width=12, height=12, highlightthickness=0)
+        self.ocr_status_light.pack(side="left", padx=(6, 0))
+        self._ocr_light_id = self.ocr_status_light.create_oval(1, 1, 11, 11, fill="#cc0000", outline="#888888")
         ttk.Label(ocr_header, textvariable=self.target_force_var,
-                  font=("Consolas", 14, "bold"), foreground="#999999").grid(row=0, column=1, sticky="e")
-        ttk.Label(ocr_card, textvariable=self.ocr_value_var, style="BigValue.TLabel").grid(row=1, column=0, sticky="w")
+                  font=("Consolas", 14, "bold"), foreground="#999999", width=22, anchor="e").grid(row=0, column=1, sticky="e", padx=(0, 40))
+        ttk.Label(ocr_card, textvariable=self.ocr_value_var, style="BigValue.TLabel", width=14, anchor="w").grid(row=1, column=0, sticky="w")
 
         self._error_live_label(left, "Live % Error", self.live_error_var, 2)
         self._small_label(left, "HADI Raw R (mV/V)", self.hadi_raw_var, 3)
 
         self.big_capture_button = ttk.Button(
             left,
-            text="CAPTURE  (Space / Enter)",
+            text="CAPTURE  (Space)",
             command=self._capture,
             style="BigCapture.TButton",
         )
@@ -611,7 +665,8 @@ class App(tk.Tk):
         btns = ttk.Frame(right)
         btns.pack(fill="x", padx=10, pady=10)
 
-        ttk.Label(btns, text="Capacity:").pack(side="left", padx=(0, 2))
+        self.capacity_label_var = tk.StringVar(value="Capacity (LBF):")
+        ttk.Label(btns, textvariable=self.capacity_label_var).pack(side="left", padx=(0, 2))
         cap_entry = ttk.Entry(btns, textvariable=self.customer_capacity_var, width=7)
         cap_entry.pack(side="left")
         cap_entry.bind("<Return>", lambda _e: self._apply_customer_capacity())
@@ -631,7 +686,7 @@ class App(tk.Tk):
         self.custom_point_entry = ttk.Entry(btns, textvariable=self.custom_point_count_var, width=5)
         self.custom_point_set_btn = ttk.Button(btns, text="Set", command=self._apply_point_count)
 
-        ttk.Button(btns, text="Clear", command=self._clear_captures).pack(side="right", padx=(4, 0))
+        ttk.Button(btns, text="Clear", command=self._clear_captures).pack(side="right", padx=(10, 0))
         ttk.Button(
             btns,
             text="⤓ Save",
@@ -646,7 +701,12 @@ class App(tk.Tk):
         tables.rowconfigure(1, weight=1)
 
         ttk.Label(tables, text="Run 1", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Label(tables, text="Run 2", font=("Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=(6, 0))
+        run2_header = ttk.Frame(tables)
+        run2_header.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Label(run2_header, text="Run 2", font=("Segoe UI", 10, "bold")).pack(side="left")
+        self.copy_w_btn = ttk.Button(run2_header, text="← Copy W from Run 1", command=self._copy_weights_to_run2)
+        self.copy_w_btn.pack(side="right")
+        self.copy_w_btn.pack_forget()
 
         run_cols = ("point", "hadi", "ocr", "error")
         self.run1_tree = ttk.Treeview(tables, columns=run_cols, show="headings", height=18, selectmode="extended")
@@ -707,7 +767,13 @@ class App(tk.Tk):
 
         gps_box = ttk.LabelFrame(root, text="Gravity / GPS")
         gps_box.pack(fill="x", **pad)
-        ttk.Label(gps_box, textvariable=self.gps_status_var).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(gps_box, textvariable=self.gps_status_var).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=6)
+        ttk.Label(gps_box, text="MF Override").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        mf_entry = ttk.Entry(gps_box, textvariable=self.mf_override_var, width=12)
+        mf_entry.grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Button(gps_box, text="Apply", command=self._apply_mf_override).grid(row=1, column=2, sticky="w", padx=6)
+        ttk.Label(gps_box, text="Leave blank to use GPS (or 1.0 if no GPS)").grid(
+            row=1, column=3, sticky="w", padx=(10, 6), pady=6)
 
         sync_box = ttk.LabelFrame(root, text="Sync Calibration")
         sync_box.pack(fill="x", **pad)
@@ -715,6 +781,32 @@ class App(tk.Tk):
         ttk.Label(sync_box, text="Cal lag (ms)").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         ttk.Entry(sync_box, textvariable=self.cal_lag_ms_var, width=8).grid(row=1, column=1, sticky="w", pady=6)
         ttk.Button(sync_box, text="Set", command=self._apply_calibration_lag).grid(row=1, column=2, sticky="w", padx=6)
+
+        med_box = ttk.LabelFrame(root, text="Capture Median")
+        med_box.pack(fill="x", **pad)
+        ttk.Label(med_box, text="Half-window (seconds, default 0.5)").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(med_box, textvariable=self.manual_median_window_var, width=8).grid(row=0, column=1, sticky="w", pady=6)
+        ttk.Label(med_box, text="Samples ±this many seconds around the keypress").grid(
+            row=0, column=2, sticky="w", padx=(10, 6), pady=6)
+
+        req_box = ttk.LabelFrame(root, text="Capture Requirements")
+        req_box.pack(fill="x", **pad)
+        ttk.Checkbutton(req_box, text="Require both HADI and OCR to capture", variable=self.require_both_var).grid(
+            row=0, column=0, sticky="w", padx=6, pady=6)
+
+        ac_box = ttk.LabelFrame(root, text="Experimental")
+        ac_box.pack(fill="x", **pad)
+        ttk.Checkbutton(ac_box, text="Enable auto-capture at target", variable=self.auto_capture_enabled,
+                         command=self._reset_auto_capture_state).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=6)
+        ttk.Label(ac_box, text="Dwell (seconds)").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(ac_box, textvariable=self.auto_capture_dwell_var, width=8).grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Label(ac_box, text="Hold in range this long before capturing").grid(
+            row=1, column=2, sticky="w", padx=(10, 6), pady=6)
+        ttk.Checkbutton(ac_box, text="Voice announcements (announces target and capture)",
+                         variable=self.auto_capture_voice_var).grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=6)
+        ttk.Label(ac_box, text="Operator name").grid(row=3, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(ac_box, textvariable=self.operator_name_var, width=20).grid(row=3, column=1, columnspan=2, sticky="w", pady=6)
+        self.auto_capture_status_var = tk.StringVar(value="")
 
     def _build_load_cells_tab(self, root):
         pad = {"padx": 10, "pady": 8}
@@ -775,6 +867,77 @@ class App(tk.Tk):
             text="Saved load cells are stored in load_cells.json next to the app, so they will be there next time.",
         ).grid(row=6, column=0, columnspan=7, sticky="w", padx=10, pady=16)
 
+    def _build_converter_tab(self, root):
+        pad = {"padx": 10, "pady": 8}
+        units = ["LBF", "KGF", "N", "kN", "gF", "t"]
+
+        box = ttk.LabelFrame(root, text="Unit Converter")
+        box.pack(fill="x", **pad)
+
+        self.conv_input_var = tk.StringVar(value="")
+        self.conv_from_var = tk.StringVar(value="LBF")
+        self.conv_to_var = tk.StringVar(value="kN")
+
+        ttk.Label(box, text="Value", font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", padx=6, pady=8)
+        conv_entry = ttk.Entry(box, textvariable=self.conv_input_var, width=20, font=("Consolas", 14))
+        conv_entry.grid(row=0, column=1, sticky="w", padx=6, pady=8)
+        conv_entry.bind("<KeyRelease>", lambda _e: self._update_converter())
+
+        ttk.Label(box, text="From").grid(row=0, column=2, sticky="w", padx=(20, 4), pady=8)
+        from_combo = ttk.Combobox(box, textvariable=self.conv_from_var, values=units, state="readonly", width=8)
+        from_combo.grid(row=0, column=3, sticky="w", pady=8)
+        from_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_converter())
+
+        ttk.Label(box, text="→", font=("Segoe UI", 14)).grid(row=0, column=4, padx=10, pady=8)
+
+        ttk.Label(box, text="To").grid(row=0, column=5, sticky="w", padx=(0, 4), pady=8)
+        to_combo = ttk.Combobox(box, textvariable=self.conv_to_var, values=units, state="readonly", width=8)
+        to_combo.grid(row=0, column=6, sticky="w", pady=8)
+        to_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_converter())
+
+        self.conv_result_var = tk.StringVar(value="")
+        ttk.Label(box, textvariable=self.conv_result_var, font=("Consolas", 20, "bold")).grid(
+            row=1, column=0, columnspan=7, sticky="w", padx=6, pady=(4, 12))
+
+        all_box = ttk.LabelFrame(root, text="All Conversions")
+        all_box.pack(fill="x", **pad)
+        self.conv_all_labels: dict[str, tk.StringVar] = {}
+        for i, unit in enumerate(units):
+            ttk.Label(all_box, text=f"{unit}:", font=("Segoe UI", 10, "bold")).grid(
+                row=i, column=0, sticky="w", padx=6, pady=3)
+            var = tk.StringVar(value="")
+            self.conv_all_labels[unit] = var
+            ttk.Label(all_box, textvariable=var, font=("Consolas", 12)).grid(
+                row=i, column=1, sticky="w", padx=10, pady=3)
+
+    def _update_converter(self):
+        raw = self.conv_input_var.get().strip()
+        if not raw:
+            self.conv_result_var.set("")
+            for v in self.conv_all_labels.values():
+                v.set("")
+            return
+        try:
+            value = float(raw)
+        except ValueError:
+            self.conv_result_var.set("Invalid number")
+            for v in self.conv_all_labels.values():
+                v.set("")
+            return
+
+        from_unit = self.conv_from_var.get()
+        to_unit = self.conv_to_var.get()
+        from_factor = HADI_UNIT_FACTORS.get(from_unit, 1.0)
+        to_factor = HADI_UNIT_FACTORS.get(to_unit, 1.0)
+
+        converted = value * (to_factor / from_factor)
+        self.conv_result_var.set(f"{converted:.10g} {to_unit}")
+
+        for unit, var in self.conv_all_labels.items():
+            factor = HADI_UNIT_FACTORS.get(unit, 1.0)
+            result = value * (factor / from_factor)
+            var.set(f"{result:.10g}")
+
     def _hadi_live_label(self, parent, title_var: tk.StringVar, var: tk.StringVar, row: int):
         card = ttk.Frame(parent)
         card.grid(row=row, column=0, sticky="ew", padx=12, pady=(14, 0))
@@ -792,16 +955,18 @@ class App(tk.Tk):
         self._hadi_light_id = self.hadi_status_light.create_oval(1, 1, 11, 11, fill="#cc0000", outline="#888888")
         ttk.Button(header, text="ZERO", command=self._tare_indicator, style="Zero.TButton", width=8).grid(row=0, column=1, sticky="e", padx=(10, 0))
 
-        ttk.Label(card, textvariable=var, style="BigValue.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(card, textvariable=var, style="BigValue.TLabel", width=14, anchor="w").grid(row=1, column=0, sticky="w")
 
     def _error_live_label(self, parent, title: str, var: tk.StringVar, row: int):
         card = ttk.Frame(parent)
         card.grid(row=row, column=0, sticky="ew", padx=12, pady=(14, 0))
+        card.columnconfigure(0, weight=1)
         ttk.Label(card, text=title, style="LiveTitle.TLabel").pack(anchor="w")
-        self.live_error_label = ttk.Label(card, textvariable=var, style="ErrorValue.TLabel")
+        self.live_error_label = ttk.Label(card, textvariable=var, style="ErrorValue.TLabel", width=14, anchor="w")
         self.live_error_label.pack(anchor="w")
-        parent.columnconfigure(0, weight=1)
-
+        inv_cb = ttk.Checkbutton(card, text="±", variable=self.ignore_sign_var)
+        inv_cb.pack(anchor="w")
+        inv_cb.bind("<ButtonRelease-1>", self._release_button_focus, add="+")
         parent.columnconfigure(0, weight=1)
 
     def _big_label(self, parent, title: str, var: tk.StringVar, row: int):
@@ -840,6 +1005,8 @@ class App(tk.Tk):
     def _set_hadi_display_options(self):
         units = self.hadi_units_var.get()
         self.hadi_title_var.set("HADI Response (mV/V)" if units == "mV/V" else f"HADI Force ({units})")
+        if hasattr(self, "capacity_label_var"):
+            self.capacity_label_var.set(f"Capacity ({units}):")
         self._refresh_hadi_mode_badge()
         if self.latest_hadi:
             self.hadi_lbf_var.set(self._format_hadi_display_value(self.latest_hadi))
@@ -847,12 +1014,14 @@ class App(tk.Tk):
         else:
             self._update_capacity_warning(None)
         self._update_target_force_display()
+        if hasattr(self, "_ac_units_var"):
+            self._ac_units_var.set(units)
         if hasattr(self, "run1_tree"):
             self._redraw_point_table()
 
     def _refresh_hadi_mode_badge(self):
         mode = self.mode_var.get()
-        self.mode_badge_var.set(mode.upper())
+        self.mode_badge_var.set(f"↓ {mode.upper()}" if mode == "Compression" else f"↑ {mode.upper()}")
         if hasattr(self, "mode_badge_label"):
             style = "ModeBadgeCompression.TLabel" if mode == "Compression" else "ModeBadgeTension.TLabel"
             self.mode_badge_label.configure(style=style)
@@ -867,34 +1036,37 @@ class App(tk.Tk):
         if value in (None, ""):
             return ""
         try:
-            return f"{float(value):+g}"
+            return f"{float(value):+.10g}"
         except Exception:
             text = str(value).strip()
             return text if text.startswith(("+", "-")) else f"+{text}"
 
-    @staticmethod
-    def _format_ocr_text(raw_text, value=None, show_plus: bool = True) -> str:
+    def _format_ocr_text(self, raw_text, value=None, show_plus: bool = True) -> str:
         text = "" if raw_text in (None, "") else str(raw_text).strip()
         if not text and value not in (None, ""):
-            text = f"{float(value):g}"
+            text = f"{float(value):.10g}"
         if not text:
             return ""
+        if self.ignore_sign_var.get():
+            if text.startswith("-"):
+                text = text[1:]
+            else:
+                text = "-" + text.lstrip("+")
         if show_plus and not text.startswith(("+", "-")):
             return "+" + text
         if not show_plus and text.startswith("+"):
             return text[1:]
         return text
 
-    @classmethod
-    def _ocr_text_for_row(cls, run_row, show_plus: bool = True) -> str:
+    def _ocr_text_for_row(self, run_row, show_plus: bool = True) -> str:
         if not run_row or run_row.get("ocr") in (None, ""):
             return ""
-        return cls._format_ocr_text(run_row.get("ocr_text"), run_row.get("ocr"), show_plus=show_plus)
+        return self._format_ocr_text(run_row.get("ocr_text"), run_row.get("ocr"), show_plus=show_plus)
 
-    def _hadi_lbf_to_display(self, lbf_value: float) -> float:
+    def _hadi_lbf_to_display(self, lbf_value: float, raw_response: float = None) -> float:
         units = self.hadi_units_var.get()
         if units == "mV/V":
-            return lbf_value
+            return raw_response if raw_response is not None else lbf_value
         return lbf_value * HADI_UNIT_FACTORS.get(units, 1.0)
 
     def _display_to_lbf(self, display_value: float) -> float:
@@ -949,7 +1121,8 @@ class App(tk.Tk):
         try:
             decimals = self._selected_hadi_decimals()
             sign = "+" if show_plus else ""
-            return f"{float(value):{sign}.{decimals}f}"
+            v = float(value)
+            return f"{v:{sign}.{decimals}f}"
         except Exception:
             return str(value)
 
@@ -959,7 +1132,9 @@ class App(tk.Tk):
             hadi_lbf = row.get("hadi_lbf")
             if hadi_lbf not in (None, ""):
                 try:
-                    display_val = self._hadi_lbf_to_display(float(hadi_lbf))
+                    _raw = row.get("hadi_raw")
+                    _raw_f = float(_raw) if _raw not in (None, "") else None
+                    display_val = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=_raw_f)
                     row["hadi_text"] = self._format_hadi_lbf_text(display_val, show_plus=False)
                 except (TypeError, ValueError):
                     row["hadi_text"] = ""
@@ -1058,6 +1233,29 @@ class App(tk.Tk):
 
     def _set_hadi_light(self, color: str):
         self.hadi_status_light.itemconfig(self._hadi_light_id, fill=color)
+
+    def _set_ocr_light(self, color: str):
+        self.ocr_status_light.itemconfig(self._ocr_light_id, fill=color)
+
+    def _on_ocr_heartbeat(self):
+        self._ocr_last_packet_pc = time.perf_counter()
+
+    def _update_ocr_light(self, now_pc: float):
+        if not self.ocr:
+            self._set_ocr_light("#cc0000")
+            return
+        stale = 3.0
+        reading_gap = 1.5
+        last_reading = self.ocr_last_pc_time
+        last_packet = self._ocr_last_packet_pc
+        has_reading = last_reading is not None and (now_pc - last_reading) <= reading_gap
+        has_packet = last_packet is not None and (now_pc - last_packet) <= stale
+        if has_reading:
+            self._set_ocr_light("#00aa00")
+        elif has_packet:
+            self._set_ocr_light("#ccaa00")
+        else:
+            self._set_ocr_light("#cc0000")
 
     def _kick_auto_scan(self):
         if self.hadi.is_connected():
@@ -1161,6 +1359,7 @@ class App(tk.Tk):
             self.ocr = OCRReceiver(port=int(self.ocr_port_var.get()))
             self.ocr.on_reading = self._on_ocr_reading
             self.ocr.on_gps = self._on_gps_fix
+            self.ocr.on_heartbeat = self._on_ocr_heartbeat
             self.ocr.start()
             self.ocr_button_var.set("Stop OCR")
             self.status_var.set("OCR running")
@@ -1176,7 +1375,9 @@ class App(tk.Tk):
         self.ocr_button_var.set("Start OCR")
         self.latest_ocr = None
         self.ocr_last_pc_time = None
+        self._ocr_last_packet_pc = None
         self.ocr_value_var.set("---")
+        self._set_ocr_light("#cc0000")
         self._update_live_percent_error()
 
     def _toggle_mode(self):
@@ -1224,11 +1425,13 @@ class App(tk.Tk):
             self.editor_combo["values"] = names
 
         if names:
-            if self.selected_load_cell_name.get() not in names:
-                self.selected_load_cell_name.set(names[0])
+            current = self.selected_load_cell_name.get()
+            if current and current not in names:
+                self.selected_load_cell_name.set("")
             if not self.editor_select_var.get() or self.editor_select_var.get() not in names:
-                self.editor_select_var.set(self.selected_load_cell_name.get())
-            self._select_load_cell()
+                self.editor_select_var.set(names[0])
+            if self.selected_load_cell_name.get():
+                self._select_load_cell()
             self._load_cell_into_editor()
 
     def _load_cell_into_editor(self):
@@ -1347,9 +1550,11 @@ class App(tk.Tk):
             self.latest_ocr = sample
             self.ocr_buffer.append(sample)
         self.ocr_last_pc_time = now_pc
+        self._ocr_last_packet_pc = now_pc
         self._prune_buffers(now_pc)
 
     def _on_gps_fix(self, gps):
+        self._ocr_last_packet_pc = time.perf_counter()
         altitude_m = getattr(gps, "altitude_m", None)
         g = normal_gravity_m_s2(gps.latitude, altitude_m)
         fix = GPSFix(
@@ -1384,6 +1589,22 @@ class App(tk.Tk):
             f"Gravity locked | MF {locked.gravity_factor:.7f}"
         )
         self.w_button_var.set(f"SELECT / UNSELECT W    MF {locked.gravity_factor:.7f}")
+
+    def _apply_mf_override(self):
+        raw = self.mf_override_var.get().strip()
+        if not raw:
+            self._mf_override = None
+            self.gps_status_var.set("MF override cleared — using GPS (or 1.0 if no GPS)")
+            self.w_button_var.set("SELECT / UNSELECT W")
+            return
+        try:
+            val = float(raw)
+        except ValueError:
+            self.gps_status_var.set("Invalid MF value — enter a number or leave blank")
+            return
+        self._mf_override = val
+        self.gps_status_var.set(f"MF override active | MF {val:.7f}")
+        self.w_button_var.set(f"SELECT / UNSELECT W    MF {val:.7f}")
 
     @staticmethod
     def _interp(samples, t, attr):
@@ -1607,8 +1828,11 @@ class App(tk.Tk):
             self.hadi_buffer.append(item)
             self._prune_buffers(item.pc_time)
             self.hadi_raw_var.set(f"{item.raw_response:+.5f}")
-            self.hadi_lbf_var.set(self._format_hadi_display_value(item))
-            self._update_capacity_warning(item)
+            if self.selected_load_cell_name.get():
+                self.hadi_lbf_var.set(self._format_hadi_display_value(item))
+                self._update_capacity_warning(item)
+            else:
+                self.hadi_lbf_var.set("↑ Select Cell")
             self.raw_text_var.set(item.raw_text)
 
         if not got_hadi and not self._hadi_is_fresh(now_pc):
@@ -1620,14 +1844,22 @@ class App(tk.Tk):
             if r is None or not self._ocr_is_fresh(now_pc):
                 self._set_ocr_waiting_display()
             else:
-                self.ocr_value_var.set(self._format_ocr_text(r.raw_text, r.value))
+                live_text = "" if r.raw_text in (None, "") else str(r.raw_text).strip()
+                if not live_text:
+                    live_text = f"{r.value:g}"
+                if not live_text.startswith(("+", "-")):
+                    live_text = "+" + live_text
+                self.ocr_value_var.set(live_text)
         else:
             self._set_ocr_waiting_display()
+
+        self._update_ocr_light(now_pc)
 
         self._update_ocr_overload_warning()
         self._update_overload_badge()
         self._estimate_sync_lag()
         self._update_live_percent_error()
+        self._check_auto_capture()
 
         if self._auto_scan_active and not self.hadi.is_connected():
             self._kick_auto_scan()
@@ -1792,6 +2024,29 @@ class App(tk.Tk):
                 self.custom_point_count_var.set(str(needed))
         self._update_target_force_display()
 
+        first_empty = self._first_empty_from(0, self.capture_target_run)
+        if first_empty is not None:
+            self._select_target(*first_empty)
+        self._speak_greeting(capacity, count)
+
+    def _speak_greeting(self, capacity: float, points: int):
+        name = self.operator_name_var.get().strip()
+        greeting = f"Hello {name}, " if name else "Hello, "
+        mode = self.mode_var.get().lower()
+        units = self.hadi_units_var.get()
+        cell = self._find_load_cell(self.selected_load_cell_name.get())
+        if cell:
+            cell_cap = cell.get("capacity_lbf", "")
+            greeting += f"you have your {cell_cap} pound calibration load cell in {mode} "
+        else:
+            greeting += f"you have your calibration load cell in {mode} "
+        greeting += (f"and are calibrating a {capacity:g} {units} capacity, "
+                     f"{points} points. Don't forget to preload. Let's begin. ")
+        first_target = self._target_speech_text()
+        if first_target:
+            greeting += first_target
+        self._speak(greeting)
+
     def _update_target_force_display(self):
         idx = self.capture_target_index
         if not self.target_forces or idx is None or idx >= len(self.target_forces):
@@ -1800,12 +2055,11 @@ class App(tk.Tk):
         val = self.target_forces[idx]
         units = self.hadi_units_var.get()
         if units == "mV/V":
-            self.target_force_var.set(f"Target: {val:g} LBF")
+            self.target_force_var.set(f"▶ {val:g} LBF")
         else:
             factor = HADI_UNIT_FACTORS.get(units, 1.0)
             converted = val * factor
-            decimals = _decimals_from_step(self.hadi_decimals_var.get())
-            self.target_force_var.set(f"Target: {converted:.{decimals}f} {units}")
+            self.target_force_var.set(f"▶ {converted:.10g} {units}")
 
     def _redraw_point_table(self):
         for tree in self._both_trees():
@@ -1826,7 +2080,9 @@ class App(tk.Tk):
         hadi_text = ""
         if run_row and run_row.get("hadi_lbf") is not None:
             try:
-                display_val = self._hadi_lbf_to_display(float(run_row["hadi_lbf"]))
+                _raw = run_row.get("hadi_raw")
+                _raw_f = float(_raw) if _raw not in (None, "") else None
+                display_val = self._hadi_lbf_to_display(float(run_row["hadi_lbf"]), raw_response=_raw_f)
                 hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False)
             except (TypeError, ValueError):
                 hadi_text = ""
@@ -1859,8 +2115,7 @@ class App(tk.Tk):
         except Exception:
             return ""
 
-    @staticmethod
-    def _calculate_percent_error(ocr_value, hadi_value):
+    def _calculate_percent_error(self, ocr_value, hadi_value):
         """Return (percent_error, is_na).
 
         A zero OCR/reference value is still a valid capture value, but percent
@@ -1872,6 +2127,8 @@ class App(tk.Tk):
             hadi = float(hadi_value)
         except Exception:
             return None, False
+        if self.ignore_sign_var.get():
+            ocr = -ocr
         if ocr == 0:
             return None, True
         return ((ocr - hadi) / ocr) * 100.0, False
@@ -1972,6 +2229,7 @@ class App(tk.Tk):
             return
         if self.ocr_edit_entry is not None:
             return
+        self._update_copy_w_button()
 
     def _on_run_tree_click(self, event, run: int):
         if self.ocr_edit_entry is not None:
@@ -2133,6 +2391,8 @@ class App(tk.Tk):
         self.ocr_edit_run = None
         self.edit_cell_kind = None
 
+        if not raw:
+            return "break"
         try:
             new_value = float(raw)
         except ValueError:
@@ -2202,7 +2462,9 @@ class App(tk.Tk):
             run_row["ocr_edited"] = True
 
             try:
-                hadi_value = self._hadi_lbf_to_display(float(run_row.get("hadi_lbf")))
+                _raw = run_row.get("hadi_raw")
+                _raw_f = float(_raw) if _raw not in (None, "") else None
+                hadi_value = self._hadi_lbf_to_display(float(run_row.get("hadi_lbf")), raw_response=_raw_f)
             except Exception:
                 hadi_value = None
 
@@ -2341,7 +2603,9 @@ class App(tk.Tk):
             hadi_lbf = run_row.get("hadi_lbf")
             if hadi_lbf not in (None, ""):
                 try:
-                    display_val = self._hadi_lbf_to_display(float(hadi_lbf))
+                    _raw = run_row.get("hadi_raw")
+                    _raw_f = float(_raw) if _raw not in (None, "") else None
+                    display_val = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=_raw_f)
                     hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False)
                 except (TypeError, ValueError):
                     pass
@@ -2352,30 +2616,64 @@ class App(tk.Tk):
             ])
         return rows
 
+    def _csv_row_for_point(self, run_key: str, point_row: dict):
+        run_row = point_row.get(run_key)
+        if not run_row:
+            return ["", "", ""]
+        hadi_text = ""
+        hadi_lbf = run_row.get("hadi_lbf")
+        if hadi_lbf not in (None, ""):
+            try:
+                _raw = run_row.get("hadi_raw")
+                _raw_f = float(_raw) if _raw not in (None, "") else None
+                display_val = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=_raw_f)
+                hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False)
+            except (TypeError, ValueError):
+                pass
+        return [
+            self._ocr_text_for_row(run_row, show_plus=False),
+            hadi_text,
+            self._csv_fmt_error(run_row.get("percent_error"), run_row.get("percent_error_na", False)),
+        ]
+
     def _write_capture_csv(self, path) -> int:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        has_run1 = self._run_has_data("run1")
+        has_run2 = self._run_has_data("run2")
+        units = self.hadi_units_var.get()
+        fields = self._capture_csv_fields()
 
         total_rows = 0
         with path.open("w", newline="") as f:
             writer = csv.writer(f)
 
-            units = self.hadi_units_var.get()
-            if self._run_has_data("run1"):
-                writer.writerow([f"Run 1 (HADI: {units})"])
-                writer.writerow(self._capture_csv_fields())
-                run_rows = self._capture_csv_rows_for_run("run1")
-                writer.writerows(run_rows)
-                total_rows += len(run_rows)
-
-            if self._run_has_data("run2"):
-                if total_rows:
-                    writer.writerow([])
-                writer.writerow([f"Run 2 (HADI: {units})"])
-                writer.writerow(self._capture_csv_fields())
-                run_rows = self._capture_csv_rows_for_run("run2")
-                writer.writerows(run_rows)
-                total_rows += len(run_rows)
+            if has_run1 and has_run2:
+                writer.writerow([f"Run 1 ({units})", "", "", "", f"Run 2 ({units})"])
+                writer.writerow(fields + [""] + fields)
+                for point_row in self.capture_rows:
+                    r1 = self._csv_row_for_point("run1", point_row)
+                    r2 = self._csv_row_for_point("run2", point_row)
+                    if r1 != ["", "", ""] or r2 != ["", "", ""]:
+                        writer.writerow(r1 + [""] + r2)
+                        total_rows += 1
+            elif has_run1:
+                writer.writerow([f"Run 1 ({units})"])
+                writer.writerow(fields)
+                for point_row in self.capture_rows:
+                    r1 = self._csv_row_for_point("run1", point_row)
+                    if r1 != ["", "", ""]:
+                        writer.writerow(r1)
+                        total_rows += 1
+            elif has_run2:
+                writer.writerow([f"Run 2 ({units})"])
+                writer.writerow(fields)
+                for point_row in self.capture_rows:
+                    r2 = self._csv_row_for_point("run2", point_row)
+                    if r2 != ["", "", ""]:
+                        writer.writerow(r2)
+                        total_rows += 1
 
         return total_rows
 
@@ -2456,7 +2754,12 @@ class App(tk.Tk):
             messagebox.showwarning("Missing weight", "This W row does not have a HADI/weight value.")
             return False
 
-        hadi_display = self._hadi_lbf_to_display(hadi_lbf)
+        hadi_raw_val = run_row.get("hadi_raw")
+        try:
+            hadi_raw_val = float(hadi_raw_val) if hadi_raw_val not in (None, "") else None
+        except (TypeError, ValueError):
+            hadi_raw_val = None
+        hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw_val)
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
 
         run_row["time"] = datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds")
@@ -2532,18 +2835,21 @@ class App(tk.Tk):
 
     def _update_live_percent_error(self):
         now_pc = time.perf_counter()
-        if not self._hadi_is_fresh(now_pc) or not self._ocr_is_fresh(now_pc):
+        hadi_fresh = self._hadi_is_fresh(now_pc)
+        ocr_fresh = self._ocr_is_fresh(now_pc)
+        if not hadi_fresh or not ocr_fresh:
             self.live_error_var.set("--")
             self._set_live_error_color(None)
             return
 
         try:
             hadi_lbf = self.latest_hadi.force_lbf if self.latest_hadi else None
+            hadi_raw = self.latest_hadi.raw_response if self.latest_hadi else None
             with self.ocr_lock:
                 ocr = self.latest_ocr.value if self.latest_ocr else None
             if hadi_lbf is None or ocr is None:
                 raise ValueError
-            hadi = self._hadi_lbf_to_display(hadi_lbf)
+            hadi = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
             err, is_na = self._calculate_percent_error(ocr, hadi)
             if is_na:
                 self.live_error_var.set("NA")
@@ -2559,38 +2865,66 @@ class App(tk.Tk):
         now_pc = time.perf_counter()
         self._prune_buffers(now_pc)
 
-        if not self._hadi_is_fresh(now_pc):
+        need_both = self.require_both_var.get()
+
+        if need_both and not self._hadi_is_fresh(now_pc):
             raise RuntimeError("Waiting for fresh HADI readings.")
-        if not self._ocr_is_fresh(now_pc):
+        if need_both and not self._ocr_is_fresh(now_pc):
             raise RuntimeError("Waiting for fresh OCR packets.")
+        if not need_both:
+            if not self._hadi_is_fresh(now_pc) and not self._ocr_is_fresh(now_pc):
+                raise RuntimeError("No HADI or OCR data available.")
 
         hadi_samples = [s for s in self.hadi_buffer if (now_pc - s.pc_time) <= self.hadi_wait_seconds]
         with self.ocr_lock:
             ocr_samples = [s for s in self.ocr_buffer if (now_pc - s.pc_time) <= self.ocr_wait_seconds]
 
-        if len(hadi_samples) < 2:
+        if need_both and len(hadi_samples) < 2:
             raise RuntimeError("Need at least two fresh HADI readings.")
-        if len(ocr_samples) < 2:
+        if need_both and len(ocr_samples) < 2:
             raise RuntimeError("Need at least two fresh OCR readings.")
 
-        latest_hadi_t = hadi_samples[-1].pc_time
-        latest_ocr_corrected_t = self._corrected_ocr_time(ocr_samples[-1])
-        target_t = min(now_pc, latest_hadi_t, latest_ocr_corrected_t)
+        hadi_lbf = None
+        hadi_raw = None
+        ocr_value = None
+        ocr_text = ""
+        target_t = now_pc
 
-        hadi_lbf = self._interp(hadi_samples, target_t, "force_lbf")
-        hadi_raw = self._interp(hadi_samples, target_t, "raw_response")
+        if hadi_samples:
+            latest_hadi_t = hadi_samples[-1].pc_time
+            target_t = min(target_t, latest_hadi_t)
+        if ocr_samples:
+            latest_ocr_corrected_t = self._corrected_ocr_time(ocr_samples[-1])
+            target_t = min(target_t, latest_ocr_corrected_t)
 
-        # OCR is a screen reading, so use the nearest actual OCR packet instead
-        # of interpolating and inventing decimal values that were never displayed.
-        ocr_sample = self._nearest_sample(ocr_samples, target_t, corrected_ocr=True)
-        ocr_value = None if ocr_sample is None else ocr_sample.value
-        ocr_text = "" if ocr_sample is None else ocr_sample.raw_text
+        if hadi_samples:
+            hadi_lbf = self._interp(hadi_samples, target_t, "force_lbf")
+            hadi_raw = self._interp(hadi_samples, target_t, "raw_response")
 
-        if hadi_lbf is None or ocr_value is None:
-            raise RuntimeError("Could not match fresh HADI/OCR readings at the same corrected instant.")
+        if ocr_samples:
+            ocr_sample = self._nearest_sample(ocr_samples, target_t, corrected_ocr=True)
+            ocr_value = None if ocr_sample is None else ocr_sample.value
+            ocr_text = "" if ocr_sample is None else ocr_sample.raw_text
+
+        if need_both and hadi_lbf is None:
+            raise RuntimeError("Could not interpolate HADI reading.")
+        if need_both and ocr_value is None:
+            raise RuntimeError("Could not match OCR reading.")
+
         return now_pc, time.time(), target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text
 
     def _gravity_context(self):
+        mf = getattr(self, "_mf_override", None)
+        if mf is not None:
+            return {
+                "gravity_factor": mf,
+                "gravity_m_s2": mf * STANDARD_GRAVITY,
+                "gps_latitude": "",
+                "gps_longitude": "",
+                "gps_altitude_m": "",
+                "note": f"manual MF override {mf:.7f}",
+                "using_gps": False,
+            }
         gps = getattr(self, "locked_gps", None) if USE_GPS_GRAVITY_CORRECTION else None
         if gps is None:
             return {
@@ -2694,8 +3028,13 @@ class App(tk.Tk):
 
     def _recalculate_row_error(self, row: dict):
         hadi_lbf = row.get("hadi_lbf")
+        hadi_raw = row.get("hadi_raw")
         try:
-            hadi_display = self._hadi_lbf_to_display(float(hadi_lbf)) if hadi_lbf not in (None, "") else None
+            raw_val = float(hadi_raw) if hadi_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            raw_val = None
+        try:
+            hadi_display = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=raw_val) if hadi_lbf not in (None, "") else None
         except (TypeError, ValueError):
             hadi_display = None
         err, is_na = self._calculate_percent_error(row.get("ocr"), hadi_display)
@@ -2809,6 +3148,60 @@ class App(tk.Tk):
             self._mark_data_changed()
             pass
 
+    def _selected_run1_w_indexes(self) -> list[int]:
+        selected = self.run1_tree.selection()
+        if len(selected) < 2:
+            return []
+        children = list(self.run1_tree.get_children())
+        indexes = []
+        for item_id in selected:
+            try:
+                idx = children.index(item_id)
+            except ValueError:
+                continue
+            run1 = self.capture_rows[idx].get("run1")
+            if run1 and run1.get("nominal_weight_lbf") not in (None, ""):
+                indexes.append(idx)
+        return indexes
+
+    def _update_copy_w_button(self):
+        if not hasattr(self, "copy_w_btn"):
+            return
+        if self._selected_run1_w_indexes():
+            self.copy_w_btn.pack(side="right")
+        else:
+            self.copy_w_btn.pack_forget()
+
+    def _copy_weights_to_run2(self):
+        indexes = self._selected_run1_w_indexes()
+        if not indexes:
+            return
+
+        has_run2 = any(
+            self.capture_rows[i].get("run2") is not None for i in indexes
+        )
+        if has_run2:
+            if not messagebox.askyesno(
+                "Overwrite Run 2?",
+                f"Some selected rows already have Run 2 data. Copy {len(indexes)} W rows to Run 2?",
+            ):
+                return
+
+        copied = 0
+        for i in indexes:
+            run1 = self.capture_rows[i]["run1"]
+            nominal = float(run1["nominal_weight_lbf"])
+            row = self._make_manual_weight_row(nominal)
+            row["point"] = self.capture_rows[i]["point"]
+            row["run"] = 2
+            row["pre_w_hadi_lbf"] = nominal
+            self.capture_rows[i]["run2"] = row
+            copied += 1
+
+        self._redraw_point_table()
+        self._mark_data_changed()
+        self.status_var.set(f"Copied {copied} W rows to Run 2")
+
     def _set_selected_weight_reference(self):
         try:
             now_pc, now_wall, target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text = self._current_synced_values()
@@ -2870,41 +3263,207 @@ class App(tk.Tk):
         self._update_point_count_label()
         pass
 
-    def _capture_from_key(self, _event=None):
-        if self.ocr_edit_entry is not None:
-            return "break"
-        self.focus_set()
-        self._capture()
-        return "break"
+    def _update_ac_indicator_visibility(self):
+        if self.auto_capture_enabled.get():
+            self._ac_indicator_frame.place(relx=0.5, rely=0.5, anchor="w", x=80)
+            self._ac_gauge.pack(fill="x", padx=10, pady=(0, 2),
+                                before=self._ac_display_frame)
+        else:
+            self._ac_indicator_frame.place_forget()
+            self._ac_gauge.pack_forget()
 
-    def _capture(self):
-        target_index, target_run, weight_row = self._target_weight_row()
-        if weight_row is not None:
-            # W rows are pre-filled weight references. They only need OCR.
-            # Do not require HADI, and do not overwrite the HADI/weight value.
-            self._capture_into_weight_row(target_index, target_run, weight_row)
+    _TTS_SCRIPT = (
+        "Add-Type -AssemblyName System.Speech;"
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+        "$s.Rate = 2; $s.Speak('%s')"
+    )
+
+    def _speak(self, text: str):
+        if not self.auto_capture_voice_var.get():
+            return
+        safe = text.replace("'", "''")
+        cmd = self._TTS_SCRIPT % safe
+        threading.Thread(
+            target=lambda: subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                creationflags=0x08000000,
+            ),
+            daemon=True,
+        ).start()
+
+    def _target_speech_text(self) -> str:
+        idx = self.capture_target_index
+        if idx is None or not self.target_forces or idx >= len(self.target_forces):
+            return ""
+        val = self.target_forces[idx]
+        units = self.hadi_units_var.get()
+        if units == "mV/V":
+            return f"target {val:g} pounds"
+        factor = HADI_UNIT_FACTORS.get(units, 1.0)
+        converted = val * factor
+        return f"target {converted:.10g} {units}"
+
+    def _speak_capture_and_next(self):
+        next_text = self._target_speech_text()
+        if next_text:
+            self._speak(f"captured. {next_text}")
+        else:
+            self._speak("captured")
+
+    def _redraw_ac_gauge(self):
+        c = self._ac_gauge
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 20:
+            return
+
+        tol = self._ac_gauge_tolerance
+        if tol <= 0:
+            tol = 1.0
+        error = self._ac_gauge_error
+        view_range = tol * 3.0
+        cx = w / 2
+        half = w / 2
+
+        tol_px = (tol / view_range) * half
+        green_l = cx - tol_px
+        green_r = cx + tol_px
+
+        c.create_rectangle(0, 0, w, h, fill="#fecaca", outline="")
+        c.create_rectangle(green_l, 0, green_r, h, fill="#bbf7d0", outline="")
+        c.create_line(green_l, 0, green_l, h, fill="#16a34a", width=2)
+        c.create_line(green_r, 0, green_r, h, fill="#16a34a", width=2)
+        c.create_line(cx, 2, cx, h - 2, fill="#d1d5db", width=1, dash=(2, 2))
+
+        if self._ac_gauge_active:
+            needle_px = (error / view_range) * half
+            nx = cx + max(-(half - 4), min(half - 4, needle_px))
+            c.create_polygon(nx - 5, 0, nx + 5, 0, nx, 7, fill="#0f172a")
+            c.create_polygon(nx - 5, h, nx + 5, h, nx, h - 7, fill="#0f172a")
+            c.create_line(nx, 3, nx, h - 3, fill="#0f172a", width=2)
+
+    def _reset_auto_capture_state(self):
+        self._auto_capture_in_range_since = None
+        self._auto_capture_last_index = None
+        self._auto_capture_last_run = None
+        self.auto_capture_status_var.set("")
+        self._ac_status_label_var.set("")
+        self._ac_gauge_active = False
+        self._redraw_ac_gauge()
+        self._update_ac_indicator_visibility()
+        if self.auto_capture_enabled.get():
+            text = self._target_speech_text()
+            if text:
+                self._speak(text)
+
+    def _check_auto_capture(self):
+        if not self.auto_capture_enabled.get():
+            return
+        if not self.target_forces:
+            return
+
+        self._ac_units_var.set(self.hadi_units_var.get())
+
+        idx = self.capture_target_index
+        run = self.capture_target_run
+        if idx is None or not (0 <= idx < len(self.target_forces)):
+
+            self._ac_status_label_var.set("")
+            self._ac_gauge_active = False
+            self._redraw_ac_gauge()
+            return
+
+        target_lbf = self.target_forces[idx]
+        if target_lbf == 0:
+            return
+
+        target_display = self._hadi_lbf_to_display(target_lbf)
+        if target_display == 0:
+            return
+
+        now_pc = time.perf_counter()
+        if not self._ocr_is_fresh(now_pc):
+            self._auto_capture_in_range_since = None
+
+            self._ac_status_label_var.set("waiting")
+            self._ac_gauge_active = False
+            self._redraw_ac_gauge()
+            return
+
+        with self.ocr_lock:
+            ocr = self.latest_ocr
+        if ocr is None:
+            self._auto_capture_in_range_since = None
             return
 
         try:
-            now_pc, now_wall, target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text = self._current_synced_values()
-        except RuntimeError as exc:
-            messagebox.showwarning("No synced values", str(exc))
+            tolerance = float(self.auto_capture_tolerance_var.get())
+            dwell_seconds = float(self.auto_capture_dwell_var.get())
+        except ValueError:
             return
 
-        hadi_display = self._hadi_lbf_to_display(hadi_lbf)
+        ocr_val = -ocr.value if self.ignore_sign_var.get() else ocr.value
+        signed_error = ocr_val - target_display
+        abs_error = abs(signed_error)
+
+        self._ac_gauge_error = signed_error
+        self._ac_gauge_tolerance = tolerance
+        self._ac_gauge_active = True
+        self._redraw_ac_gauge()
+
+        if idx != self._auto_capture_last_index or run != self._auto_capture_last_run:
+            self._auto_capture_in_range_since = None
+            self._auto_capture_last_index = idx
+            self._auto_capture_last_run = run
+
+        if abs_error <= tolerance:
+
+            if self._auto_capture_in_range_since is None:
+                self._auto_capture_in_range_since = now_pc
+            elapsed = now_pc - self._auto_capture_in_range_since
+            remaining = dwell_seconds - elapsed
+            if remaining <= 0:
+                self._auto_capture_in_range_since = None
+                self._fire_auto_capture(idx, run, dwell_seconds)
+            else:
+                self._ac_status_label_var.set(f"{remaining:.1f}s")
+        else:
+            self._auto_capture_in_range_since = None
+
+            self._ac_status_label_var.set(f"off by {abs_error:.1f}")
+
+    def _fire_auto_capture(self, idx: int, run: int, dwell_seconds: float):
+        now_pc = time.perf_counter()
+        now_wall = time.time()
+        window_start = now_pc - dwell_seconds
+
+        hadi_samples = [s for s in self.hadi_buffer if s.pc_time >= window_start]
+        with self.ocr_lock:
+            ocr_samples = [s for s in self.ocr_buffer if s.pc_time >= window_start]
+
+        if not hadi_samples or not ocr_samples:
+            self.auto_capture_status_var.set("Auto-capture: not enough samples")
+            return
+
+        hadi_lbf = statistics.median(s.force_lbf for s in hadi_samples)
+        hadi_raw = statistics.median(s.raw_response for s in hadi_samples)
+        ocr_value = statistics.median(s.value for s in ocr_samples)
+        ocr_text = f"{ocr_value:.10g}"
+
+        hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
-        target_delay_ms = (now_pc - target_t) * 1000.0
 
         row = {
-            "point": (self.capture_target_index + 1) if self.capture_target_index is not None else "",
+            "point": idx + 1,
             "time": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
             "load_cell": self.selected_load_cell_name.get(),
             "mode": self.mode_var.get(),
-            "method": "lag_corrected_instant_interpolated",
-            "sync_mode": "manual" if self.sync_manual else "auto",
+            "method": f"auto_capture_median_{dwell_seconds:.1f}s",
+            "sync_mode": "auto",
             "sync_lag_ms": self.sync_lag_seconds * 1000.0,
             "sync_confidence": self.sync_confidence,
-            "target_delay_ms": target_delay_ms,
+            "target_delay_ms": "",
             "hadi_raw": hadi_raw,
             "hadi_lbf": hadi_lbf,
             "ocr": ocr_value,
@@ -2926,9 +3485,159 @@ class App(tk.Tk):
         self._insert_or_replace_capture_row(
             row,
             (
-                row.get("hadi_text", self._format_hadi_lbf_text(self._hadi_lbf_to_display(hadi_lbf))),
+                row.get("hadi_text", self._format_hadi_lbf_text(hadi_display)),
                 self._format_ocr_text(ocr_text, ocr_value),
                 "NA" if percent_error_na else f"{percent_error:+.2f}%",
+            ),
+        )
+        self._update_point_count_label()
+        self._ac_status_label_var.set(f"captured P{idx + 1}")
+        self._ac_gauge_active = False
+        self._redraw_ac_gauge()
+        self._speak_capture_and_next()
+
+    def _capture_from_key(self, _event=None):
+        if self.ocr_edit_entry is not None:
+            return "break"
+        if self.notebook.index(self.notebook.select()) != 0:
+            return
+        self.focus_set()
+        try:
+            half_window = float(self.manual_median_window_var.get())
+        except ValueError:
+            half_window = 0.5
+        self._manual_median_press_time = time.perf_counter()
+        delay_ms = int(half_window * 1000)
+        self.after(delay_ms, self._capture_manual_median)
+        return "break"
+
+    def _capture_manual_median(self):
+        press_pc = getattr(self, "_manual_median_press_time", None)
+        if press_pc is None:
+            return
+        try:
+            half_window = float(self.manual_median_window_var.get())
+        except ValueError:
+            half_window = 0.5
+
+        target_index, target_run, weight_row = self._target_weight_row()
+        if weight_row is not None:
+            self._capture_into_weight_row(target_index, target_run, weight_row)
+            return
+
+        window_start = press_pc - half_window
+        window_end = press_pc + half_window
+
+        hadi_samples = [s for s in self.hadi_buffer if window_start <= s.pc_time <= window_end]
+        with self.ocr_lock:
+            ocr_samples = [s for s in self.ocr_buffer if window_start <= s.pc_time <= window_end]
+
+        if not hadi_samples or not ocr_samples:
+            self._capture()
+            return
+
+        now_wall = time.time()
+        hadi_lbf = statistics.median(s.force_lbf for s in hadi_samples)
+        hadi_raw = statistics.median(s.raw_response for s in hadi_samples)
+        ocr_value = statistics.median(s.value for s in ocr_samples)
+        ocr_text = f"{ocr_value:.10g}"
+
+        hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
+
+        row = {
+            "point": (self.capture_target_index + 1) if self.capture_target_index is not None else "",
+            "time": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
+            "load_cell": self.selected_load_cell_name.get(),
+            "mode": self.mode_var.get(),
+            "method": f"manual_median_{half_window*2:.1f}s",
+            "sync_mode": "manual" if self.sync_manual else "auto",
+            "sync_lag_ms": self.sync_lag_seconds * 1000.0,
+            "sync_confidence": self.sync_confidence,
+            "target_delay_ms": "",
+            "hadi_raw": hadi_raw,
+            "hadi_lbf": hadi_lbf,
+            "ocr": ocr_value,
+            "ocr_text": ocr_text,
+            "ocr_edited": False,
+            "percent_error": percent_error,
+            "percent_error_na": percent_error_na,
+            "captured_hadi_lbf": hadi_lbf,
+            "conventional_lbf_from_hadi": "",
+            "nominal_weight_lbf": "",
+            "gravity_factor": "",
+            "gravity_m_s2": "",
+            "gps_latitude": "",
+            "gps_longitude": "",
+            "gps_altitude_m": "",
+        }
+        self._set_row_hadi_text(row)
+
+        self._insert_or_replace_capture_row(
+            row,
+            (
+                row.get("hadi_text", self._format_hadi_lbf_text(hadi_display)),
+                self._format_ocr_text(ocr_text, ocr_value),
+                "NA" if percent_error_na else f"{percent_error:+.2f}%",
+            ),
+        )
+        self._update_point_count_label()
+
+    def _capture(self):
+        target_index, target_run, weight_row = self._target_weight_row()
+        if weight_row is not None:
+            # W rows are pre-filled weight references. They only need OCR.
+            # Do not require HADI, and do not overwrite the HADI/weight value.
+            self._capture_into_weight_row(target_index, target_run, weight_row)
+            return
+
+        try:
+            now_pc, now_wall, target_t, hadi_lbf, hadi_raw, ocr_value, ocr_text = self._current_synced_values()
+        except RuntimeError as exc:
+            messagebox.showwarning("No synced values", str(exc))
+            return
+
+        hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw) if hadi_lbf is not None else None
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
+        target_delay_ms = (now_pc - target_t) * 1000.0
+
+        row = {
+            "point": (self.capture_target_index + 1) if self.capture_target_index is not None else "",
+            "time": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
+            "load_cell": self.selected_load_cell_name.get(),
+            "mode": self.mode_var.get(),
+            "method": "lag_corrected_instant_interpolated",
+            "sync_mode": "manual" if self.sync_manual else "auto",
+            "sync_lag_ms": self.sync_lag_seconds * 1000.0,
+            "sync_confidence": self.sync_confidence,
+            "target_delay_ms": target_delay_ms,
+            "hadi_raw": hadi_raw if hadi_raw is not None else "",
+            "hadi_lbf": hadi_lbf if hadi_lbf is not None else "",
+            "ocr": ocr_value if ocr_value is not None else "",
+            "ocr_text": ocr_text,
+            "ocr_edited": False,
+            "percent_error": percent_error,
+            "percent_error_na": percent_error_na,
+            "captured_hadi_lbf": hadi_lbf if hadi_lbf is not None else "",
+            "conventional_lbf_from_hadi": "",
+            "nominal_weight_lbf": "",
+            "gravity_factor": "",
+            "gravity_m_s2": "",
+            "gps_latitude": "",
+            "gps_longitude": "",
+            "gps_altitude_m": "",
+        }
+        self._set_row_hadi_text(row)
+
+        hadi_fallback = ""
+        if hadi_display is not None:
+            hadi_fallback = self._format_hadi_lbf_text(hadi_display)
+        self._insert_or_replace_capture_row(
+            row,
+            (
+                row.get("hadi_text", hadi_fallback),
+                self._format_ocr_text(ocr_text, ocr_value) if ocr_value is not None else "",
+                "NA" if percent_error_na else (f"{percent_error:+.2f}%" if percent_error is not None else ""),
             ),
         )
         self._update_point_count_label()
