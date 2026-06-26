@@ -44,7 +44,6 @@ from ocr_stream import OCRReceiver
 APP_DIR = Path(__file__).resolve().parent
 LOAD_CELLS_FILE = APP_DIR / "load_cells.json"
 SYNC_STATE_FILE = APP_DIR / "sync_state.json"
-OPERATOR_NAME_FILE = APP_DIR / "operator_name.txt"
 AUTOSAVE_DIR = APP_DIR / "autosaves"
 
 # Starting calibration from the current Morehouse certificate.
@@ -103,15 +102,6 @@ def save_load_cells(load_cells: list[dict]) -> None:
     LOAD_CELLS_FILE.write_text(json.dumps(load_cells, indent=2), encoding="utf-8")
 
 
-def _load_operator_name() -> str:
-    try:
-        return OPERATOR_NAME_FILE.read_text(encoding="utf-8").strip()
-    except Exception:
-        return ""
-
-
-def _save_operator_name(name: str) -> None:
-    OPERATOR_NAME_FILE.write_text(name.strip(), encoding="utf-8")
 
 
 def force_from_response(response_mv_v: float, mode: str, load_cell: dict) -> float:
@@ -440,8 +430,6 @@ class App(tk.Tk):
         self.auto_capture_tolerance_var = tk.StringVar(value="1.0")
         self.auto_capture_dwell_var = tk.StringVar(value="3.0")
         self.auto_capture_voice_var = tk.BooleanVar(value=True)
-        self.operator_name_var = tk.StringVar(value=_load_operator_name())
-        self.operator_name_var.trace_add("write", lambda *_: _save_operator_name(self.operator_name_var.get()))
 
         self.manual_median_enabled = tk.BooleanVar(value=True)
         self.manual_median_window_var = tk.StringVar(value="0.5")
@@ -804,8 +792,6 @@ class App(tk.Tk):
             row=1, column=2, sticky="w", padx=(10, 6), pady=6)
         ttk.Checkbutton(ac_box, text="Voice announcements (announces target and capture)",
                          variable=self.auto_capture_voice_var).grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=6)
-        ttk.Label(ac_box, text="Operator name").grid(row=3, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(ac_box, textvariable=self.operator_name_var, width=20).grid(row=3, column=1, columnspan=2, sticky="w", pady=6)
         self.auto_capture_status_var = tk.StringVar(value="")
 
     def _build_load_cells_tab(self, root):
@@ -2030,8 +2016,7 @@ class App(tk.Tk):
         self._speak_greeting(capacity, count)
 
     def _speak_greeting(self, capacity: float, points: int):
-        name = self.operator_name_var.get().strip()
-        greeting = f"Hello {name}, " if name else "Hello, "
+        greeting = "Hello, "
         mode = self.mode_var.get().lower()
         units = self.hadi_units_var.get()
         cell = self._find_load_cell(self.selected_load_cell_name.get())
