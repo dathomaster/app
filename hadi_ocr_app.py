@@ -374,7 +374,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("HADI + OCR Capture")
-        self.geometry("1125x703")
+        self.geometry("1115x703")
         self.minsize(980, 650)
 
         self.load_cells = load_saved_load_cells()
@@ -401,7 +401,6 @@ class App(tk.Tk):
         self.ocr_edit_tree = None
         self.suppress_next_tree_select = False
         self.suppress_next_tree_click = False
-        self.suppress_next_tree_click = False
 
         # Auto-sync method:
         # continuously estimate a fixed OCR-vs-HADI lag from recent waveform shape,
@@ -422,19 +421,19 @@ class App(tk.Tk):
         self.ocr_lock = threading.Lock()
         self._last_sync_update = 0.0
 
+        self.serial_number_var = tk.StringVar(value="")
         self.customer_capacity_var = tk.StringVar(value="")
         self.target_force_var = tk.StringVar(value="")
         self.target_forces: list[float] = []
 
-        self.auto_capture_enabled = tk.BooleanVar(value=True)
+        self.flip_sign_var = tk.BooleanVar(value=False)
+        self.auto_capture_enabled = tk.BooleanVar(value=False)
         self.auto_capture_tolerance_var = tk.StringVar(value="1.0")
         self.auto_capture_dwell_var = tk.StringVar(value="3.0")
-        self.auto_capture_voice_var = tk.BooleanVar(value=True)
+        self.auto_capture_voice_var = tk.BooleanVar(value=False)
 
-        self.manual_median_enabled = tk.BooleanVar(value=True)
         self.manual_median_window_var = tk.StringVar(value="0.5")
         self.require_both_var = tk.BooleanVar(value=False)
-        self.ignore_sign_var = tk.BooleanVar(value=False)
         self._auto_capture_in_range_since: Optional[float] = None
         self._auto_capture_last_index: Optional[int] = None
         self._auto_capture_last_run: Optional[int] = None
@@ -443,13 +442,11 @@ class App(tk.Tk):
         self._mf_override: Optional[float] = None
         self.gps_status_var = tk.StringVar(value="Gravity: waiting for GPS")
         self.mf_override_var = tk.StringVar(value="")
-        self.weight_status_var = tk.StringVar(value="Select rows and click SELECT / UNSELECT W")
         self.manual_weight_var = tk.StringVar(value="")
-        self.weight_choice_var = tk.StringVar(value="")
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="19200")
-        self.mode_var = tk.StringVar(value="Compression")
+        self.mode_var = tk.StringVar(value="Tension")
         self.hadi_units_var = tk.StringVar(value="LBF")
         self.hadi_decimals_var = tk.StringVar(value="0.00001")
         self.hadi_title_var = tk.StringVar(value="HADI Force (LBF)")
@@ -471,7 +468,6 @@ class App(tk.Tk):
         self._ocr_last_packet_pc = None
         self.hadi_wait_seconds = 1.5
         self.ocr_wait_seconds = 1.5
-        self.ocr_age_var = tk.StringVar(value="")
         self.raw_text_var = tk.StringVar(value="")
         self.hadi_button_var = tk.StringVar(value="Connect HADI")
         self.ocr_button_var = tk.StringVar(value="Start OCR")
@@ -479,7 +475,6 @@ class App(tk.Tk):
         self.target_var = tk.StringVar(value="Next: P1 R1")
         self.sync_status_var = tk.StringVar(value="Sync: starting...")
         self.sync_lag_ms_var = tk.StringVar(value=f"{self.sync_lag_seconds * 1000.0:.0f}")
-        self.sync_mode_var = tk.StringVar(value="Auto")
         self.cal_lag_ms_var = tk.StringVar(
             value=f"{self.calibration_lag_seconds * 1000.0:.0f}" if self.calibration_lag_seconds > 0 else ""
         )
@@ -489,6 +484,8 @@ class App(tk.Tk):
         self.last_autosave_path = None
         self.autosave_name = None
         AUTOSAVE_DIR.mkdir(exist_ok=True)
+
+        self.report_entries: list[dict] = []
 
         self.editor_select_var = tk.StringVar()
         self.cell_name_var = tk.StringVar()
@@ -532,47 +529,52 @@ class App(tk.Tk):
         self.connection_tab = ttk.Frame(self.notebook)
         self.load_cells_tab = ttk.Frame(self.notebook)
         self.converter_tab = ttk.Frame(self.notebook)
+        self.report_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.capture_tab, text="Capture")
-        self.notebook.add(self.connection_tab, text="Settings")
         self.notebook.add(self.load_cells_tab, text="Load Cells")
         self.notebook.add(self.converter_tab, text="Converter")
+        self.notebook.add(self.report_tab, text="Report")
+        self.notebook.add(self.connection_tab, text="Settings")
 
         self._build_capture_tab(self.capture_tab)
         self._build_connection_tab(self.connection_tab)
         self._build_load_cells_tab(self.load_cells_tab)
         self._build_converter_tab(self.converter_tab)
+        self._build_report_tab(self.report_tab)
 
     def _build_capture_tab(self, root):
         pad = {"padx": 10, "pady": 8}
 
-        controls = ttk.LabelFrame(root, text="Run")
-        controls.pack(fill="x", **pad)
+        self._load_cell_icon_img = tk.PhotoImage(file=str(APP_DIR / "load_cell_icon.png"))
+        controls = ttk.LabelFrame(root, text="Load Cell")
+        controls.pack(fill="x", padx=10, pady=(4, 2))
 
-        ttk.Label(controls, text="Load Cell").grid(row=0, column=0, sticky="w", padx=(6, 2), pady=4)
+        ttk.Label(controls, image=self._load_cell_icon_img).grid(row=0, column=0, sticky="w", padx=(6, 2), pady=1)
         self.load_cell_combo = ttk.Combobox(
             controls,
             textvariable=self.selected_load_cell_name,
             values=[c["name"] for c in self.load_cells],
             state="readonly",
-            width=30,
+            width=32,
+            font=("Segoe UI", 10),
         )
-        self.load_cell_combo.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=4)
+        self.load_cell_combo.grid(row=0, column=1, sticky="w", padx=(6, 12), pady=4)
         self.load_cell_combo.bind("<<ComboboxSelected>>", lambda _e: self._select_load_cell())
 
         ttk.Label(controls, text="Units").grid(row=0, column=2, sticky="w", padx=(12, 2), pady=4)
-        units = ttk.Combobox(controls, textvariable=self.hadi_units_var, values=["LBF", "KGF", "N", "kN", "gF", "t", "mV/V"], state="readonly", width=8)
+        units = ttk.Combobox(controls, textvariable=self.hadi_units_var, values=["LBF", "KGF", "N", "kN", "gF", "t", "mV/V"], state="readonly", width=9, font=("Segoe UI", 10))
         units.grid(row=0, column=3, sticky="w", padx=(0, 12), pady=4)
         units.bind("<<ComboboxSelected>>", lambda _e: self._set_hadi_display_options())
 
         ttk.Label(controls, text="Decimals").grid(row=0, column=4, sticky="w", pady=4)
-        decimals = ttk.Combobox(controls, textvariable=self.hadi_decimals_var, values=HADI_DECIMAL_OPTIONS, state="readonly", width=8)
+        decimals = ttk.Combobox(controls, textvariable=self.hadi_decimals_var, values=HADI_DECIMAL_OPTIONS, state="readonly", width=9, font=("Segoe UI", 10))
         decimals.grid(row=0, column=5, sticky="w", padx=(0, 12), pady=4)
         decimals.bind("<<ComboboxSelected>>", lambda _e: self._set_hadi_display_options())
 
 
         mode_bar = ttk.Frame(root)
-        mode_bar.pack(fill="x", padx=10, pady=(0, 2))
+        mode_bar.pack(fill="x", padx=10, pady=(6, 2))
         mode_bar.columnconfigure(0, weight=1)
         mode_bar.columnconfigure(1, weight=0)
         mode_bar.columnconfigure(2, weight=1)
@@ -653,12 +655,15 @@ class App(tk.Tk):
         btns = ttk.Frame(right)
         btns.pack(fill="x", padx=10, pady=10)
 
+        ttk.Label(btns, text="S/N:").pack(side="left", padx=(0, 2))
+        ttk.Entry(btns, textvariable=self.serial_number_var, width=14).pack(side="left")
+
         self.capacity_label_var = tk.StringVar(value="Capacity (LBF):")
-        ttk.Label(btns, textvariable=self.capacity_label_var).pack(side="left", padx=(0, 2))
+        ttk.Label(btns, textvariable=self.capacity_label_var).pack(side="left", padx=(8, 2))
         cap_entry = ttk.Entry(btns, textvariable=self.customer_capacity_var, width=7)
         cap_entry.pack(side="left")
         cap_entry.bind("<Return>", lambda _e: self._apply_customer_capacity())
-        ttk.Button(btns, text="Set", command=self._apply_customer_capacity, width=3).pack(side="left", padx=(2, 0))
+        cap_entry.bind("<FocusOut>", lambda _e: self._apply_customer_capacity())
 
         ttk.Label(btns, text="Points").pack(side="left", padx=(14, 4))
         self.point_count_combo = ttk.Combobox(
@@ -674,7 +679,7 @@ class App(tk.Tk):
         self.custom_point_entry = ttk.Entry(btns, textvariable=self.custom_point_count_var, width=5)
         self.custom_point_set_btn = ttk.Button(btns, text="Set", command=self._apply_point_count)
 
-        ttk.Button(btns, text="Clear", command=self._clear_captures).pack(side="right", padx=(10, 0))
+        ttk.Button(btns, text="Clear", command=self._clear_captures, width=5).pack(side="right", padx=(10, 0))
         ttk.Button(
             btns,
             text="⤓ Save",
@@ -721,9 +726,6 @@ class App(tk.Tk):
         self.run2_tree.bind("<ButtonRelease-1>", lambda e: self._on_run_tree_click(e, 2))
         self.run1_tree.bind("<Double-1>", lambda e: self._on_run_tree_double_click(e, 1))
         self.run2_tree.bind("<Double-1>", lambda e: self._on_run_tree_double_click(e, 2))
-
-        # Compatibility alias for older helper code paths.
-        self.tree = self.run1_tree
 
         self._initialize_point_rows(11)
 
@@ -924,6 +926,251 @@ class App(tk.Tk):
             result = value * (factor / from_factor)
             var.set(f"{result:.10g}")
 
+    def _build_report_tab(self, root):
+        pad = {"padx": 10, "pady": 8}
+
+        top = ttk.Frame(root)
+        top.pack(fill="x", **pad)
+        self.report_summary_var = tk.StringVar(value="No runs saved yet")
+        ttk.Label(top, textvariable=self.report_summary_var, font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Button(top, text="Export S/N", command=self._export_report).pack(side="right", padx=(10, 0))
+        ttk.Label(top, text="S/N:").pack(side="right", padx=(10, 2))
+        self.report_sn_var = tk.StringVar(value="")
+        self.report_sn_combo = ttk.Combobox(top, textvariable=self.report_sn_var, state="readonly", width=14)
+        self.report_sn_combo.pack(side="right")
+        self.report_sn_combo.bind("<<ComboboxSelected>>", lambda _e: self._filter_report_by_sn())
+        ttk.Button(top, text="Clear Report", command=self._clear_report).pack(side="right", padx=(0, 10))
+
+        tree_frame = ttk.Frame(root)
+        tree_frame.pack(fill="both", expand=True, **pad)
+
+        cols = ("run", "mode", "sn", "load_cell", "points", "date")
+        self.report_tree = ttk.Treeview(tree_frame, columns=cols, show="tree headings", height=8, selectmode="browse")
+        self.report_tree.heading("#0", text="")
+        self.report_tree.column("#0", width=30, stretch=False)
+        self.report_tree.heading("run", text="Run")
+        self.report_tree.column("run", width=60, anchor="center", stretch=False)
+        self.report_tree.heading("mode", text="Mode")
+        self.report_tree.column("mode", width=110, anchor="center", stretch=False)
+        self.report_tree.heading("sn", text="S/N")
+        self.report_tree.column("sn", width=100, anchor="center", stretch=False)
+        self.report_tree.heading("load_cell", text="Load Cell")
+        self.report_tree.column("load_cell", width=220, anchor="w")
+        self.report_tree.heading("points", text="Points")
+        self.report_tree.column("points", width=60, anchor="center", stretch=False)
+        self.report_tree.heading("date", text="Date")
+        self.report_tree.column("date", width=160, anchor="center")
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.report_tree.yview)
+        self.report_tree.configure(yscrollcommand=scrollbar.set)
+        self.report_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.report_tree.bind("<<TreeviewOpen>>", lambda _e: self._on_report_expand())
+        self.report_tree.bind("<<TreeviewClose>>", lambda _e: None)
+
+    def _add_to_report(self):
+        if not self._has_capture_data():
+            return
+
+        mode = self.mode_var.get()
+        sn = self.serial_number_var.get().strip()
+        load_cell = self.selected_load_cell_name.get()
+        units = self.hadi_units_var.get()
+        decimals = self.hadi_decimals_var.get()
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        for run in (1, 2):
+            run_data = []
+            for i, point_row in enumerate(self.capture_rows):
+                rr = point_row.get(f"run{run}")
+                if rr and rr.get("ocr") not in (None, ""):
+                    run_data.append(dict(rr))
+            if not run_data:
+                continue
+
+            entry = {
+                "run": run,
+                "mode": mode,
+                "sn": sn,
+                "load_cell": load_cell,
+                "units": units,
+                "decimals": decimals,
+                "timestamp": timestamp,
+                "point_count": len(run_data),
+                "rows": run_data,
+            }
+            self.report_entries.insert(0, entry)
+
+        self._refresh_report_tree()
+
+    def _refresh_report_tree(self):
+        all_sns = list(dict.fromkeys(e.get("sn", "") or "(no S/N)" for e in self.report_entries))
+        self.report_sn_combo["values"] = all_sns
+        if all_sns and not self.report_sn_var.get():
+            self.report_sn_var.set(all_sns[0])
+        elif self.report_sn_var.get() not in all_sns:
+            self.report_sn_var.set(all_sns[0] if all_sns else "")
+        self._filter_report_by_sn()
+
+    def _filter_report_by_sn(self):
+        selected_sn = self.report_sn_var.get()
+        self.report_tree.delete(*self.report_tree.get_children())
+
+        filtered = [e for e in self.report_entries if (e.get("sn", "") or "(no S/N)") == selected_sn]
+
+        for i, entry in enumerate(filtered):
+            parent_id = self.report_tree.insert(
+                "", "end",
+                iid=f"report_{i}",
+                text="+",
+                values=(
+                    f"R{entry['run']}",
+                    entry["mode"],
+                    entry.get("sn", ""),
+                    entry["load_cell"],
+                    str(entry["point_count"]),
+                    entry["timestamp"],
+                ),
+            )
+            for j, row in enumerate(entry["rows"]):
+                hadi_text = row.get("hadi_text", "")
+                ocr_text = self._ocr_text_for_row(row, show_plus=False)
+                pct = ""
+                if row.get("percent_error_na"):
+                    pct = "NA"
+                elif row.get("percent_error") is not None:
+                    try:
+                        pct = f"{float(row['percent_error']):+.2f}%"
+                    except Exception:
+                        pass
+                self.report_tree.insert(
+                    parent_id, "end",
+                    iid=f"report_{i}_row_{j}",
+                    text="",
+                    values=(
+                        f"P{row.get('point', j + 1)}",
+                        "",
+                        "",
+                        f"HADI: {hadi_text}",
+                        f"OCR: {ocr_text}",
+                        pct,
+                    ),
+                )
+
+        total = len(self.report_entries)
+        shown = len(filtered)
+        if total == 0:
+            self.report_summary_var.set("No runs saved yet")
+        else:
+            self.report_summary_var.set(f"{shown} run{'s' if shown != 1 else ''} for S/N: {selected_sn}  ({total} total)")
+
+    def _clear_report(self):
+        if not self.report_entries:
+            return
+        if not messagebox.askyesno("Clear report?", "Remove all runs from the report?"):
+            return
+        self.report_entries.clear()
+        self.report_sn_var.set("")
+        self.report_sn_combo["values"] = []
+        self.report_tree.delete(*self.report_tree.get_children())
+        self.report_summary_var.set("No runs saved yet")
+
+    def _export_report(self):
+        selected_sn = self.report_sn_var.get()
+        if not selected_sn:
+            messagebox.showinfo("Nothing to export", "Select a S/N to export.")
+            return
+
+        entries = [e for e in self.report_entries if (e.get("sn", "") or "(no S/N)") == selected_sn]
+        if not entries:
+            messagebox.showinfo("Nothing to export", f"No runs for S/N: {selected_sn}")
+            return
+
+        sn_clean = selected_sn.replace(" ", "_").replace("/", "-")
+        cap = self.customer_capacity_var.get().strip()
+        units = self.hadi_units_var.get()
+        parts = ["report"]
+        if cap:
+            parts.append(f"{cap}{units}")
+        parts.append(sn_clean)
+        parts.append(datetime.now().strftime("%y%m%d_%H%M"))
+        default_name = "_".join(parts) + ".csv"
+
+        path = filedialog.asksaveasfilename(
+            title=f"Export Report — S/N: {selected_sn}",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+
+                writer.writerow(["CALIBRATION REPORT"])
+                writer.writerow(["S/N", selected_sn])
+                load_cells = set(e["load_cell"] for e in entries if e.get("load_cell"))
+                if load_cells:
+                    writer.writerow(["Load Cell", ", ".join(load_cells)])
+                units_set = set(e.get("units", "") for e in entries if e.get("units"))
+                if units_set:
+                    writer.writerow(["Units", ", ".join(units_set)])
+                writer.writerow(["Exported", datetime.now().isoformat(timespec="seconds")])
+                writer.writerow([])
+
+                def _find_entry(mode, run):
+                    for e in entries:
+                        if e["mode"] == mode and e["run"] == run:
+                            return e
+                    return None
+
+                slots = [
+                    ("Tension", 1), ("Tension", 2),
+                    ("Compression", 1), ("Compression", 2),
+                ]
+                sections = []
+                for mode, run in slots:
+                    entry = _find_entry(mode, run)
+                    if entry is not None:
+                        sections.append((mode, run, entry))
+
+                if not sections:
+                    writer.writerow(["No data"])
+                else:
+                    header = ["#"]
+                    for mode, run, _entry in sections:
+                        label = f"{mode} R{run}"
+                        header.extend([f"{label} HADI", f"{label} OCR", f"{label} %"])
+                    writer.writerow(header)
+
+                    max_points = max(len(s[2]["rows"]) for s in sections)
+                    for i in range(max_points):
+                        csv_row = [str(i + 1)]
+                        for _mode, _run, entry in sections:
+                            if i < len(entry["rows"]):
+                                row = entry["rows"][i]
+                                hadi_text = row.get("hadi_text", "")
+                                ocr_text = self._ocr_text_for_row(row, show_plus=False)
+                                pct = ""
+                                if row.get("percent_error_na"):
+                                    pct = "NA"
+                                elif row.get("percent_error") is not None:
+                                    try:
+                                        pct = f"{float(row['percent_error']):+.2f}%"
+                                    except Exception:
+                                        pass
+                                csv_row.extend([hadi_text, ocr_text, pct])
+                            else:
+                                csv_row.extend(["", "", ""])
+                        writer.writerow(csv_row)
+
+            messagebox.showinfo("Exported", f"Report for S/N: {selected_sn} saved to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+
     def _hadi_live_label(self, parent, title_var: tk.StringVar, var: tk.StringVar, row: int):
         card = ttk.Frame(parent)
         card.grid(row=row, column=0, sticky="ew", padx=12, pady=(14, 0))
@@ -947,12 +1194,13 @@ class App(tk.Tk):
         card = ttk.Frame(parent)
         card.grid(row=row, column=0, sticky="ew", padx=12, pady=(14, 0))
         card.columnconfigure(0, weight=1)
-        ttk.Label(card, text=title, style="LiveTitle.TLabel").pack(anchor="w")
+        header = ttk.Frame(card)
+        header.pack(anchor="w", fill="x")
+        ttk.Label(header, text=title, style="LiveTitle.TLabel").pack(side="left")
+        flip_cb = ttk.Checkbutton(header, text="Flip ±", variable=self.flip_sign_var, takefocus=False)
+        flip_cb.pack(side="left", padx=(12, 0))
         self.live_error_label = ttk.Label(card, textvariable=var, style="ErrorValue.TLabel", width=14, anchor="w")
         self.live_error_label.pack(anchor="w")
-        inv_cb = ttk.Checkbutton(card, text="±", variable=self.ignore_sign_var)
-        inv_cb.pack(anchor="w")
-        inv_cb.bind("<ButtonRelease-1>", self._release_button_focus, add="+")
         parent.columnconfigure(0, weight=1)
 
     def _big_label(self, parent, title: str, var: tk.StringVar, row: int):
@@ -1033,11 +1281,6 @@ class App(tk.Tk):
             text = f"{float(value):.10g}"
         if not text:
             return ""
-        if self.ignore_sign_var.get():
-            if text.startswith("-"):
-                text = text[1:]
-            else:
-                text = "-" + text.lstrip("+")
         if show_plus and not text.startswith(("+", "-")):
             return "+" + text
         if not show_plus and text.startswith("+"):
@@ -2112,8 +2355,6 @@ class App(tk.Tk):
             hadi = float(hadi_value)
         except Exception:
             return None, False
-        if self.ignore_sign_var.get():
-            ocr = -ocr
         if ocr == 0:
             return None, True
         return ((ocr - hadi) / ocr) * 100.0, False
@@ -2206,7 +2447,13 @@ class App(tk.Tk):
                 return
 
         next_empty = self._first_empty_from(next_index, run)
-        self._select_target(*(next_empty if next_empty is not None else (index, run)))
+        if next_empty is not None:
+            self._select_target(*next_empty)
+        else:
+            if next_index < len(self.capture_rows):
+                self._select_target(next_index, run)
+            else:
+                self._select_target(0, run)
 
     def _on_run_tree_select(self, _event, run: int):
         if self.suppress_next_tree_select:
@@ -2326,9 +2573,6 @@ class App(tk.Tk):
         entry.bind("<Escape>", self._cancel_ocr_edit)
         entry.bind("<FocusOut>", self._commit_ocr_edit)
 
-    def _start_ocr_cell_edit(self, tree, item_id, row_index: int, run: int):
-        self._start_cell_edit(tree, item_id, row_index, run, "ocr")
-
     def _cancel_ocr_edit(self, _event=None):
         if self.ocr_edit_entry is not None:
             try:
@@ -2407,7 +2651,6 @@ class App(tk.Tk):
                 row["pre_w_hadi_lbf"] = new_value
                 row["ocr_edited"] = existing.get("ocr_edited", False)
                 self.capture_rows[row_index][f"run{run}"] = row
-                pass
             else:
                 existing.update({
                     "point": row_index + 1,
@@ -2436,7 +2679,6 @@ class App(tk.Tk):
                 existing.setdefault("ocr_edited", False)
                 self._recalculate_row_error(existing)
                 self.capture_rows[row_index][f"run{run}"] = existing
-                pass
         else:
             run_row = self.capture_rows[row_index].get(f"run{run}")
             if run_row is None:
@@ -2493,9 +2735,6 @@ class App(tk.Tk):
         self.focus_set()
         return "break"
 
-    def _on_capture_row_select(self, _event=None):
-        return
-
     def _clear_override_selection(self, update_tree=True):
         run = self.capture_target_run if self.capture_target_run in (1, 2) else 1
         next_empty = self._first_empty_from(0, run)
@@ -2546,10 +2785,20 @@ class App(tk.Tk):
     def _default_csv_filename(self, autosave=False):
         mode = self._mode_for_filename()
         runs = "_".join(self._runs_with_data())
-        stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        suffix = "SN"  # Leave this at the end so you can quickly type the serial number.
+        stamp = datetime.now().strftime("%y%m%d_%H%M")
+        sn = self.serial_number_var.get().strip().replace(" ", "_").replace("/", "-")
+        cap = self.customer_capacity_var.get().strip()
         prefix = "autosave_" if autosave else ""
-        return f"{prefix}{mode}_{runs}_{stamp}_{suffix}.csv"
+        parts = []
+        if cap:
+            units = self.hadi_units_var.get()
+            parts.append(f"{cap}{units}")
+        if sn:
+            parts.append(sn)
+        parts.append(prefix + mode)
+        parts.append(runs)
+        parts.append(stamp)
+        return "_".join(parts) + ".csv"
 
     def _capture_csv_fields(self):
         return ["OCR", "HADI", "% Error"]
@@ -2732,6 +2981,10 @@ class App(tk.Tk):
         except RuntimeError as exc:
             messagebox.showwarning("No OCR value", str(exc))
             return False
+
+        if self.flip_sign_var.get() and ocr_value is not None:
+            ocr_value = -ocr_value
+            ocr_text = f"{ocr_value:.10g}"
 
         try:
             hadi_lbf = float(run_row.get("hadi_lbf"))
@@ -3131,7 +3384,6 @@ class App(tk.Tk):
 
         if toggled_on or toggled_off:
             self._mark_data_changed()
-            pass
 
     def _selected_run1_w_indexes(self) -> list[int]:
         selected = self.run1_tree.selection()
@@ -3246,7 +3498,6 @@ class App(tk.Tk):
             ),
         )
         self._update_point_count_label()
-        pass
 
     def _update_ac_indicator_visibility(self):
         if self.auto_capture_enabled.get():
@@ -3388,7 +3639,7 @@ class App(tk.Tk):
         except ValueError:
             return
 
-        ocr_val = -ocr.value if self.ignore_sign_var.get() else ocr.value
+        ocr_val = ocr.value
         signed_error = ocr_val - target_display
         abs_error = abs(signed_error)
 
@@ -3435,6 +3686,10 @@ class App(tk.Tk):
         hadi_raw = statistics.median(s.raw_response for s in hadi_samples)
         ocr_value = statistics.median(s.value for s in ocr_samples)
         ocr_text = f"{ocr_value:.10g}"
+
+        if self.flip_sign_var.get():
+            ocr_value = -ocr_value
+            ocr_text = f"{ocr_value:.10g}"
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
@@ -3527,6 +3782,10 @@ class App(tk.Tk):
         ocr_value = statistics.median(s.value for s in ocr_samples)
         ocr_text = f"{ocr_value:.10g}"
 
+        if self.flip_sign_var.get():
+            ocr_value = -ocr_value
+            ocr_text = f"{ocr_value:.10g}"
+
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
 
@@ -3581,6 +3840,10 @@ class App(tk.Tk):
         except RuntimeError as exc:
             messagebox.showwarning("No synced values", str(exc))
             return
+
+        if self.flip_sign_var.get() and ocr_value is not None:
+            ocr_value = -ocr_value
+            ocr_text = f"{ocr_value:.10g}"
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw) if hadi_lbf is not None else None
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
@@ -3649,7 +3912,8 @@ class App(tk.Tk):
 
         self.last_manual_save_path = Path(path)
         self.dirty_data = False
-        messagebox.showinfo("Saved", f"Saved {row_count} rows to:\n{path}")
+        self._add_to_report()
+        messagebox.showinfo("Saved", f"Saved {row_count} rows to:\n{path}\n\nRun added to Report tab.")
         return True
 
     def _clear_captures(self):
