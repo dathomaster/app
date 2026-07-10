@@ -1811,6 +1811,34 @@ class App(tk.Tk):
             text = str(value).strip()
             return text if text.startswith(("+", "-")) else f"+{text}"
 
+    @staticmethod
+    def _decimal_places(text) -> int:
+        """Digits shown after the decimal point in a numeric string.
+
+        Preserves the instrument's displayed precision (e.g. '0.0000' -> 4)
+        so a value can be reformatted after negation/median without losing
+        trailing zeros the way '%g' would (0.0000 -> 0, 1.50 -> 1.5).
+        """
+        if text in (None, ""):
+            return 0
+        parts = str(text).strip().split(".", 1)
+        if len(parts) < 2:
+            return 0
+        digits = ""
+        for ch in parts[1]:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        return len(digits)
+
+    @staticmethod
+    def _fixed_decimals(value, decimals) -> str:
+        """Format value with exactly `decimals` places, avoiding '-0.0000'."""
+        if value == 0:
+            value = 0.0
+        return f"{value:.{decimals}f}"
+
     def _format_ocr_text(self, raw_text, value=None, show_plus: bool = True) -> str:
         text = "" if raw_text in (None, "") else str(raw_text).strip()
         if not text and value not in (None, ""):
@@ -3557,7 +3585,7 @@ class App(tk.Tk):
 
         if self.flip_sign_var.get() and ocr_value is not None:
             ocr_value = -ocr_value
-            ocr_text = f"{ocr_value:.10g}"
+            ocr_text = self._fixed_decimals(ocr_value, self._decimal_places(ocr_text))
 
         try:
             hadi_lbf = float(run_row.get("hadi_lbf"))
@@ -4277,11 +4305,12 @@ class App(tk.Tk):
         hadi_lbf = statistics.median(h.force_lbf for h, _ in tight)
         hadi_raw = statistics.median(h.raw_response for h, _ in tight)
         ocr_value = statistics.median(o.value for _, o in tight)
-        ocr_text = f"{ocr_value:.10g}"
+        ocr_decimals = max((self._decimal_places(o.raw_text) for _, o in tight), default=0)
+        ocr_text = self._fixed_decimals(ocr_value, ocr_decimals)
 
         if self.flip_sign_var.get():
             ocr_value = -ocr_value
-            ocr_text = f"{ocr_value:.10g}"
+            ocr_text = self._fixed_decimals(ocr_value, self._decimal_places(ocr_text))
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
@@ -4400,11 +4429,12 @@ class App(tk.Tk):
         hadi_lbf = statistics.median(h.force_lbf for h, _ in tight)
         hadi_raw = statistics.median(h.raw_response for h, _ in tight)
         ocr_value = statistics.median(o.value for _, o in tight)
-        ocr_text = f"{ocr_value:.10g}"
+        ocr_decimals = max((self._decimal_places(o.raw_text) for _, o in tight), default=0)
+        ocr_text = self._fixed_decimals(ocr_value, ocr_decimals)
 
         if self.flip_sign_var.get():
             ocr_value = -ocr_value
-            ocr_text = f"{ocr_value:.10g}"
+            ocr_text = self._fixed_decimals(ocr_value, self._decimal_places(ocr_text))
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
@@ -4468,7 +4498,7 @@ class App(tk.Tk):
 
         if self.flip_sign_var.get() and ocr_value is not None:
             ocr_value = -ocr_value
-            ocr_text = f"{ocr_value:.10g}"
+            ocr_text = self._fixed_decimals(ocr_value, self._decimal_places(ocr_text))
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw) if hadi_lbf is not None else None
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
