@@ -1,6 +1,10 @@
 # Autosave files
 autosaves/
 
+# Runtime state written by the app
+sync_state.json
+camera_prefs.json
+
 # Python cache
 __pycache__/
 *.pyc

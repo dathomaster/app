@@ -33,13 +33,18 @@ class GPSReceiver:
                     parts = line.split("\t")
                     if len(parts) < 4:
                         continue
-                    fix = {
-                        "timestamp": float(parts[1]),
-                        "latitude": float(parts[2]),
-                        "longitude": float(parts[3]),
-                        "altitude": None,
-                        "received_at": time.time(),
-                    }
+                    # A malformed packet must not kill the receiver thread —
+                    # skip the bad line and keep listening.
+                    try:
+                        fix = {
+                            "timestamp": float(parts[1]),
+                            "latitude": float(parts[2]),
+                            "longitude": float(parts[3]),
+                            "altitude": None,
+                            "received_at": time.time(),
+                        }
+                    except ValueError:
+                        continue
                     if len(parts) >= 5 and parts[4].strip() != "":
                         try:
                             fix["altitude"] = float(parts[4])
@@ -48,7 +53,7 @@ class GPSReceiver:
                     self._latest = fix
             except socket.timeout:
                 continue
-            except Exception:
+            except OSError:
                 break
 
     def latest(self) -> Optional[dict]:

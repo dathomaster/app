@@ -13,12 +13,14 @@ Keep ocr_stream.py in the same folder.
 
 from __future__ import annotations
 
+import bisect
 import csv
 import json
 import math
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -40,11 +42,57 @@ except ImportError:
 
 from ocr_stream import OCRReceiver
 
+try:
+    from webcam_ocr import WebcamOCR
+except ImportError:
+    WebcamOCR = None
 
-APP_DIR = Path(__file__).resolve().parent
+try:
+    import cv2 as _cv2
+    from PIL import Image, ImageTk
+    _HAS_WEBCAM_DEPS = True
+except ImportError:
+    _HAS_WEBCAM_DEPS = False
+
+
+if getattr(sys, "frozen", False):
+    # Running as a PyInstaller-frozen exe: __file__ resolves to the
+    # temporary extraction directory (sys._MEIPASS), which is wiped after
+    # each run, so persistent files (load cells, sync state, autosaves)
+    # must live next to the actual .exe instead. Bundled read-only assets
+    # (icons etc.) still come from the extraction directory.
+    APP_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+else:
+    APP_DIR = Path(__file__).resolve().parent
+    RESOURCE_DIR = APP_DIR
 LOAD_CELLS_FILE = APP_DIR / "load_cells.json"
 SYNC_STATE_FILE = APP_DIR / "sync_state.json"
+CAMERA_PREFS_FILE = APP_DIR / "camera_prefs.json"
 AUTOSAVE_DIR = APP_DIR / "autosaves"
+
+# Fallback default webcam (used only until a camera has actually been
+# selected/connected at least once) — matched by DirectShow device name
+# rather than index, since indices shift depending on enumeration order or
+# what's plugged in, but the name of a given physical camera stays stable.
+DEFAULT_CAMERA_NAME = "Insta360 Link 2C"
+
+
+def load_camera_prefs() -> dict:
+    if not CAMERA_PREFS_FILE.exists():
+        return {"camera_name": None}
+    try:
+        data = json.loads(CAMERA_PREFS_FILE.read_text(encoding="utf-8"))
+        return {"camera_name": data.get("camera_name")}
+    except Exception:
+        return {"camera_name": None}
+
+
+def save_camera_prefs(camera_name: str) -> None:
+    CAMERA_PREFS_FILE.write_text(
+        json.dumps({"camera_name": camera_name}, indent=2),
+        encoding="utf-8",
+    )
 
 # Starting calibration from the current Morehouse certificate.
 # Force (lbf) = B0 + B1*R + B2*R^2 + B3*R^3, where R is response in mV/V.
@@ -164,19 +212,18 @@ def normal_gravity_m_s2(latitude_deg: float, altitude_m: Optional[float] = None)
     return astm_multiplying_factor(latitude_deg, altitude_m) * STANDARD_GRAVITY
 
 
+_STANDARD_WEIGHT_CANDIDATES = tuple(
+    base * 10 ** exp for exp in range(-4, 7) for base in (1, 2, 5)
+) + tuple(float(x) for x in range(1, 1001))
+
+
 def nearest_standard_weight_lbf(value_lbf: float) -> float:
     """Nearest common 1-2-5 / whole-pound standard weight."""
     if value_lbf == 0:
         return 0.0
     sign = -1 if value_lbf < 0 else 1
     v = abs(value_lbf)
-    candidates = []
-    for exp in range(-4, 7):
-        scale = 10 ** exp
-        for base in (1, 2, 5):
-            candidates.append(base * scale)
-    candidates.extend(float(x) for x in range(1, 1001))
-    best = min(candidates, key=lambda c: abs(c - v))
+    best = min(_STANDARD_WEIGHT_CANDIDATES, key=lambda c: abs(c - v))
     return sign * best
 
 
@@ -374,7 +421,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("HADI + OCR Capture")
-        self.geometry("1115x703")
+        self.geometry("1115x720")
         self.minsize(980, 650)
 
         self.load_cells = load_saved_load_cells()
@@ -487,6 +534,23 @@ class App(tk.Tk):
 
         self.report_entries: list[dict] = []
 
+        # Webcam OCR state
+        self.webcam_ocr: Optional[WebcamOCR] = None
+        self.webcam_cam_var = tk.StringVar(value="1")
+        self.webcam_latency_var = tk.StringVar(value="190")
+        self.webcam_status_var = tk.StringVar(value="Webcam OCR stopped")
+        self.webcam_ms_var = tk.StringVar(value="--")
+        self.webcam_reading_var = tk.StringVar(value="--")
+        self.webcam_start_btn_var = tk.StringVar(value="Start Webcam OCR")
+        self.ocr_source_var = tk.StringVar(value="webcam")
+        self._webcam_roi = (540, 322, 740, 397)
+        self._camera_scan_active = False
+        self._pending_webcam_start = False
+        self._webcam_connecting = False
+        self._webcam_connect_token = 0
+        self._camera_default_pending = True
+        self._camera_prefs = load_camera_prefs()
+
         self.editor_select_var = tk.StringVar()
         self.cell_name_var = tk.StringVar()
         self.capacity_var = tk.StringVar()
@@ -499,7 +563,7 @@ class App(tk.Tk):
         self._refresh_ports()
         self._sync_load_cell_controls()
         self.after(50, self._ui_tick)
-        self.after(700, self._auto_connect_on_launch)
+        self.after(700, lambda: self._refresh_camera_list(then=self._auto_connect_on_launch))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind_all("<KeyPress-space>", self._capture_from_key)
 
@@ -513,8 +577,8 @@ class App(tk.Tk):
         style.configure("ErrorValue.TLabel", font=("Consolas", 32, "bold"))
         style.configure("SmallValue.TLabel", font=("Consolas", 16))
         style.configure("TinyValue.TLabel", font=("Consolas", 9))
-        style.configure("ModeBadgeCompression.TLabel", font=("Segoe UI", 11, "bold"), foreground="#0f5f5c", background="#d7f4f1", padding=(12, 6))
-        style.configure("ModeBadgeTension.TLabel", font=("Segoe UI", 11, "bold"), foreground="#5b2a86", background="#efe3fb", padding=(12, 6))
+        style.configure("ModeBadgeCompression.TLabel", font=("Segoe UI", 12, "bold"), foreground="#0f5f5c", background="#d7f4f1", padding=(18, 10))
+        style.configure("ModeBadgeTension.TLabel", font=("Segoe UI", 12, "bold"), foreground="#5b2a86", background="#efe3fb", padding=(18, 10))
         style.configure("OverloadBadge.TLabel", font=("Segoe UI", 11, "bold"), foreground="#ffffff", background="#c1121f", padding=(120, 6))
         style.configure("OverloadBadgeHidden.TLabel", font=("Segoe UI", 11, "bold"), foreground="#c1121f", background="#c1121f", padding=(120, 6))
         style.configure("Zero.TButton", font=("Segoe UI", 9, "bold"))
@@ -546,9 +610,18 @@ class App(tk.Tk):
     def _build_capture_tab(self, root):
         pad = {"padx": 10, "pady": 8}
 
-        self._load_cell_icon_img = tk.PhotoImage(file=str(APP_DIR / "load_cell_icon.png"))
-        controls = ttk.LabelFrame(root, text="Load Cell")
-        controls.pack(fill="x", padx=10, pady=(4, 2))
+        # Top section: load cell + mode on left, camera preview on right
+        top_section = ttk.Frame(root)
+        top_section.pack(fill="x", padx=10, pady=(4, 2))
+        top_section.columnconfigure(0, weight=1)
+        top_section.columnconfigure(1, weight=0)
+
+        left_col = ttk.Frame(top_section)
+        left_col.grid(row=0, column=0, sticky="nsew")
+
+        self._load_cell_icon_img = tk.PhotoImage(file=str(RESOURCE_DIR / "load_cell_icon.png"))
+        controls = ttk.LabelFrame(left_col, text="Load Cell")
+        controls.pack(fill="x", pady=(0, 2))
 
         ttk.Label(controls, image=self._load_cell_icon_img).grid(row=0, column=0, sticky="w", padx=(6, 2), pady=1)
         self.load_cell_combo = ttk.Combobox(
@@ -556,25 +629,30 @@ class App(tk.Tk):
             textvariable=self.selected_load_cell_name,
             values=[c["name"] for c in self.load_cells],
             state="readonly",
-            width=32,
+            width=26,
             font=("Segoe UI", 10),
         )
-        self.load_cell_combo.grid(row=0, column=1, sticky="w", padx=(6, 12), pady=4)
+        self.load_cell_combo.grid(row=0, column=1, sticky="w", padx=(6, 8), pady=4)
         self.load_cell_combo.bind("<<ComboboxSelected>>", lambda _e: self._select_load_cell())
 
-        ttk.Label(controls, text="Units").grid(row=0, column=2, sticky="w", padx=(12, 2), pady=4)
-        units = ttk.Combobox(controls, textvariable=self.hadi_units_var, values=["LBF", "KGF", "N", "kN", "gF", "t", "mV/V"], state="readonly", width=9, font=("Segoe UI", 10))
-        units.grid(row=0, column=3, sticky="w", padx=(0, 12), pady=4)
+        ttk.Label(controls, text="Units").grid(row=0, column=2, sticky="w", padx=(8, 2), pady=4)
+        units = ttk.Combobox(controls, textvariable=self.hadi_units_var, values=["LBF", "KGF", "N", "kN", "gF", "t", "mV/V"], state="readonly", width=6, font=("Segoe UI", 10))
+        units.grid(row=0, column=3, sticky="w", padx=(0, 8), pady=4)
         units.bind("<<ComboboxSelected>>", lambda _e: self._set_hadi_display_options())
 
-        ttk.Label(controls, text="Decimals").grid(row=0, column=4, sticky="w", pady=4)
-        decimals = ttk.Combobox(controls, textvariable=self.hadi_decimals_var, values=HADI_DECIMAL_OPTIONS, state="readonly", width=9, font=("Segoe UI", 10))
-        decimals.grid(row=0, column=5, sticky="w", padx=(0, 12), pady=4)
+        ttk.Label(controls, text="Dec").grid(row=0, column=4, sticky="w", pady=4)
+        decimals = ttk.Combobox(controls, textvariable=self.hadi_decimals_var, values=HADI_DECIMAL_OPTIONS, state="readonly", width=7, font=("Segoe UI", 10))
+        decimals.grid(row=0, column=5, sticky="w", padx=(0, 6), pady=4)
         decimals.bind("<<ComboboxSelected>>", lambda _e: self._set_hadi_display_options())
 
+        mode_bar = ttk.Frame(top_section)
 
-        mode_bar = ttk.Frame(root)
-        mode_bar.pack(fill="x", padx=10, pady=(6, 2))
+        def _position_mode_bar(_e=None):
+            mode_bar.place(in_=top_section, relx=0.5, anchor="n",
+                           y=controls.winfo_height() + 16)
+
+        controls.bind("<Configure>", _position_mode_bar)
+        top_section.after(0, _position_mode_bar)
         mode_bar.columnconfigure(0, weight=1)
         mode_bar.columnconfigure(1, weight=0)
         mode_bar.columnconfigure(2, weight=1)
@@ -587,7 +665,7 @@ class App(tk.Tk):
         self.mode_badge_label.bind("<Button-1>", lambda _e: self._toggle_mode())
 
         ac_frame = ttk.Frame(mode_bar)
-        ac_frame.place(relx=0.5, rely=0.5, anchor="w", x=80)
+        ac_frame.place(relx=0.5, rely=0.5, anchor="w", x=240)
         self._ac_indicator_frame = ac_frame
         ttk.Label(ac_frame, text="±", font=("Segoe UI", 10)).pack(side="left")
         ttk.Entry(ac_frame, textvariable=self.auto_capture_tolerance_var, width=5,
@@ -597,6 +675,31 @@ class App(tk.Tk):
         self._ac_status_label_var = tk.StringVar(value="")
         ttk.Label(ac_frame, textvariable=self._ac_status_label_var,
                   font=("Segoe UI", 9), foreground="#666666").pack(side="left")
+
+        # Camera preview spanning load cell row + mode badge row
+        cam_frame = ttk.Frame(top_section)
+        cam_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+        cam_header = ttk.Frame(cam_frame)
+        cam_header.pack(fill="x", pady=(0, 2))
+        ttk.Button(cam_header, text="⟳ Refresh", width=10,
+                   command=self._reconnect_to_default).pack(side="left")
+
+        self._capture_cam_canvas = tk.Canvas(cam_frame, width=300, height=100,
+                                             bg="#1a1a1a", highlightthickness=1,
+                                             highlightbackground="#555555")
+        self._capture_cam_canvas.pack(fill="both", expand=True)
+        self._capture_cam_canvas.configure(cursor="hand2")
+        self._capture_cam_canvas.bind("<Button-1>", lambda _e: self._open_cam_popup())
+        self._capture_cam_photo = None
+        self._capture_cam_img_id = None
+        self._cam_popup = None
+        self._cam_popup_canvas = None
+        self._cam_popup_photo = None
+        self._cam_popup_img_id = None
+        self._cam_popup_drawing = False
+        self._cam_popup_box_start = None
+        self._start_capture_cam_preview()
 
         self._ac_gauge = tk.Canvas(root, height=24, highlightthickness=0, bg="#e5e7eb")
         self._ac_gauge.bind("<Configure>", lambda _e: self._redraw_ac_gauge())
@@ -729,6 +832,416 @@ class App(tk.Tk):
 
         self._initialize_point_rows(11)
 
+    def _open_cam_popup(self):
+        if self._cam_popup and self._cam_popup.winfo_exists():
+            self._cam_popup.lift()
+            return
+
+        self._cam_popup = tk.Toplevel(self)
+        self._cam_popup.title("Camera — drag to set bounding box, right-click to reset")
+        self._cam_popup.geometry("640x480")
+        self._cam_popup.attributes("-topmost", True)
+        self._cam_popup.protocol("WM_DELETE_WINDOW", self._close_cam_popup)
+
+        self._cam_popup_canvas = tk.Canvas(self._cam_popup, bg="#1a1a1a", cursor="crosshair")
+        self._cam_popup_canvas.pack(fill="both", expand=True)
+        self._cam_popup_canvas.bind("<ButtonPress-1>", self._cam_popup_mouse_down)
+        self._cam_popup_canvas.bind("<B1-Motion>", self._cam_popup_mouse_drag)
+        self._cam_popup_canvas.bind("<ButtonRelease-1>", self._cam_popup_mouse_up)
+        self._cam_popup_canvas.bind("<ButtonPress-3>", self._webcam_reset_roi)
+
+        self._cam_popup_photo = None
+        self._cam_popup_img_id = None
+        self._cam_popup_tick()
+
+    def _close_cam_popup(self):
+        if self._cam_popup:
+            self._cam_popup.destroy()
+            self._cam_popup = None
+            self._cam_popup_canvas = None
+
+    def _cam_popup_tick(self):
+        if not self._cam_popup or not self._cam_popup.winfo_exists():
+            return
+        try:
+            self._cam_popup_tick_body()
+        except Exception:
+            pass
+        finally:
+            self._cam_popup.after(100, self._cam_popup_tick)
+
+    def _cam_popup_tick_body(self):
+        frame = None
+        if self.webcam_ocr and self.webcam_ocr.last_frame is not None:
+            frame = self.webcam_ocr.last_frame
+
+        if frame is not None and _HAS_WEBCAM_DEPS:
+            cw = self._cam_popup_canvas.winfo_width()
+            ch = self._cam_popup_canvas.winfo_height()
+            if cw > 1 and ch > 1:
+                fh, fw = frame.shape[:2]
+                scale = min(cw / fw, ch / fh)
+                new_w = int(fw * scale)
+                new_h = int(fh * scale)
+                resized = _cv2.resize(frame, (new_w, new_h))
+                rgb = _cv2.cvtColor(resized, _cv2.COLOR_BGR2RGB)
+
+                x1, y1, x2, y2 = self._webcam_roi
+                rx1, ry1 = int(x1 * scale), int(y1 * scale)
+                rx2, ry2 = int(x2 * scale), int(y2 * scale)
+                _cv2.rectangle(rgb, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
+
+                img = Image.fromarray(rgb)
+                self._cam_popup_photo = ImageTk.PhotoImage(img)
+                if self._cam_popup_img_id:
+                    self._cam_popup_canvas.itemconfig(
+                        self._cam_popup_img_id, image=self._cam_popup_photo)
+                else:
+                    self._cam_popup_img_id = self._cam_popup_canvas.create_image(
+                        cw // 2, ch // 2, image=self._cam_popup_photo)
+
+    def _cam_popup_to_frame(self, cx, cy):
+        if not self.webcam_ocr or self.webcam_ocr.last_frame is None:
+            return cx, cy
+        frame = self.webcam_ocr.last_frame
+        fh, fw = frame.shape[:2]
+        cw = self._cam_popup_canvas.winfo_width()
+        ch = self._cam_popup_canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return cx, cy
+        scale = min(cw / fw, ch / fh)
+        new_w = int(fw * scale)
+        new_h = int(fh * scale)
+        offset_x = (cw - new_w) // 2
+        offset_y = (ch - new_h) // 2
+        fx = int((cx - offset_x) / scale)
+        fy = int((cy - offset_y) / scale)
+        return max(0, min(fx, fw)), max(0, min(fy, fh))
+
+    def _cam_popup_mouse_down(self, event):
+        self._cam_popup_drawing = True
+        fx, fy = self._cam_popup_to_frame(event.x, event.y)
+        self._cam_popup_box_start = (fx, fy)
+
+    def _cam_popup_mouse_drag(self, event):
+        pass
+
+    def _cam_popup_mouse_up(self, event):
+        if not self._cam_popup_drawing:
+            return
+        self._cam_popup_drawing = False
+        fx, fy = self._cam_popup_to_frame(event.x, event.y)
+        sx, sy = self._cam_popup_box_start
+        x1, y1 = min(sx, fx), min(sy, fy)
+        x2, y2 = max(sx, fx), max(sy, fy)
+        if (x2 - x1) > 10 and (y2 - y1) > 10:
+            self._webcam_roi = (x1, y1, x2, y2)
+            if self.webcam_ocr:
+                self.webcam_ocr.roi.x1 = x1
+                self.webcam_ocr.roi.y1 = y1
+                self.webcam_ocr.roi.x2 = x2
+                self.webcam_ocr.roi.y2 = y2
+
+    def _start_capture_cam_preview(self):
+        self._capture_cam_tick()
+
+    def _capture_cam_tick(self):
+        # Guarded like _ui_tick: an escaped exception here (e.g. a stale ROI
+        # that falls outside a new camera's frame producing a zero-size crop)
+        # would otherwise stop the preview loop permanently.
+        try:
+            self._capture_cam_tick_body()
+        except Exception:
+            pass
+        finally:
+            interval = 200 if self.notebook.index(self.notebook.select()) == 0 else 1000
+            self.after(interval, self._capture_cam_tick)
+
+    def _capture_cam_tick_body(self):
+        frame = None
+        if self.webcam_ocr and self.webcam_ocr.last_frame is not None:
+            frame = self.webcam_ocr.last_frame
+
+        if frame is not None and _HAS_WEBCAM_DEPS:
+            cw = self._capture_cam_canvas.winfo_width()
+            ch = self._capture_cam_canvas.winfo_height()
+            if cw > 1 and ch > 1:
+                fh, fw = frame.shape[:2]
+                # Crop around ROI with 50% padding for a zoomed-in preview
+                rx1, ry1, rx2, ry2 = self._webcam_roi
+                roi_w = rx2 - rx1
+                roi_h = ry2 - ry1
+                pad_x = int(roi_w * 0.5)
+                pad_y = int(roi_h * 0.5)
+                cx1 = max(0, rx1 - pad_x)
+                cy1 = max(0, ry1 - pad_y)
+                cx2 = min(fw, rx2 + pad_x)
+                cy2 = min(fh, ry2 + pad_y)
+                cropped = frame[cy1:cy2, cx1:cx2]
+
+                crop_h, crop_w = cropped.shape[:2]
+                if crop_w < 2 or crop_h < 2:
+                    return
+                scale = min(cw / crop_w, ch / crop_h)
+                new_w = int(crop_w * scale)
+                new_h = int(crop_h * scale)
+                resized = _cv2.resize(cropped, (new_w, new_h))
+                rgb = _cv2.cvtColor(resized, _cv2.COLOR_BGR2RGB)
+
+                # Draw ROI box relative to the crop
+                x1, y1, x2, y2 = self._webcam_roi
+                rx1 = int((x1 - cx1) * scale)
+                ry1 = int((y1 - cy1) * scale)
+                rx2 = int((x2 - cx1) * scale)
+                ry2 = int((y2 - cy1) * scale)
+                _cv2.rectangle(rgb, (rx1, ry1), (rx2, ry2), (0, 255, 0), 1)
+
+                img = Image.fromarray(rgb)
+                self._capture_cam_photo = ImageTk.PhotoImage(img)
+                if self._capture_cam_img_id:
+                    self._capture_cam_canvas.itemconfig(
+                        self._capture_cam_img_id, image=self._capture_cam_photo)
+                else:
+                    self._capture_cam_img_id = self._capture_cam_canvas.create_image(
+                        cw // 2, ch // 2, image=self._capture_cam_photo)
+
+        if self.webcam_ocr:
+            fps = getattr(self.webcam_ocr, "capture_fps", 0.0)
+            fps_note = f" @ {fps:.0f} fps" if fps else ""
+            self.webcam_ms_var.set(f"{self.webcam_ocr.last_elapsed_ms:.0f} ms{fps_note}")
+            r = self.webcam_ocr.latest_reading()
+            if r:
+                self.webcam_reading_var.set(r.raw_text)
+
+    def _apply_webcam_latency(self):
+        try:
+            ms = float(self.webcam_latency_var.get())
+        except ValueError:
+            return
+        if self.webcam_ocr:
+            self.webcam_ocr.camera_latency_ms = ms
+            self.sync_lag_seconds = ms / 1000.0
+            self.sync_status_var.set(f"Sync: webcam (lag {ms:.0f} ms)")
+
+    def _on_ocr_source_change(self):
+        source = self.ocr_source_var.get()
+        if source == "phone":
+            self._stop_webcam_ocr()
+            if not self.ocr:
+                self._start_ocr(show_error=False)
+            self.webcam_status_var.set("Using iPhone UDP stream")
+        else:
+            self._stop_ocr()
+            self.webcam_status_var.set("Webcam selected — press Start Webcam OCR")
+
+    def _toggle_webcam_ocr(self):
+        if self.webcam_ocr or self._webcam_connecting:
+            self._stop_webcam_ocr()
+        else:
+            self._start_webcam_ocr()
+
+    def _on_camera_selected(self):
+        self.ocr_source_var.set("webcam")
+        # Only an explicit user selection updates the saved default camera.
+        self._start_webcam_ocr(remember=True)
+
+    def _refresh_camera_list(self, then=None):
+        if WebcamOCR is None or not _HAS_WEBCAM_DEPS:
+            if then:
+                then()
+            return
+        if self._camera_scan_active:
+            if then:
+                then()
+            return
+
+        self._camera_scan_active = True
+
+        def worker():
+            try:
+                cams = WebcamOCR.list_cameras()
+            except Exception:
+                cams = []
+            self.after(0, lambda: self._on_camera_list_ready(cams, then))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_camera_list_ready(self, cams, then=None):
+        self._camera_scan_active = False
+        if cams:
+            labels = [f"{c['index']}: {c['name']}" for c in cams]
+            self.settings_cam_combo["values"] = labels
+
+            selected_label = None
+            if self._camera_default_pending:
+                self._camera_default_pending = False
+                preferred_name = self._camera_prefs.get("camera_name") or DEFAULT_CAMERA_NAME
+                selected_label = next(
+                    (label for label, cam in zip(labels, cams)
+                     if cam["name"] == preferred_name), None)
+            if selected_label is None:
+                current_index = self._current_cam_index()
+                selected_label = next(
+                    (label for label, cam in zip(labels, cams)
+                     if cam["index"] == current_index), None)
+            if selected_label is not None:
+                self.webcam_cam_var.set(selected_label)
+        if self._pending_webcam_start:
+            self._pending_webcam_start = False
+            self._start_webcam_ocr()
+        if then:
+            then()
+
+    def _current_cam_index(self) -> Optional[int]:
+        raw = str(self.webcam_cam_var.get())
+        try:
+            return int(raw.split(":", 1)[0].strip())
+        except ValueError:
+            return None
+
+    def _current_cam_name(self) -> Optional[str]:
+        raw = str(self.webcam_cam_var.get())
+        if ":" in raw:
+            return raw.split(":", 1)[1].strip()
+        return None
+
+    def _start_webcam_ocr(self, show_error=True, remember=False):
+        if WebcamOCR is None or not _HAS_WEBCAM_DEPS:
+            if show_error:
+                messagebox.showerror("Missing dependencies",
+                                     "Install opencv-python, Pillow, and rapidocr-onnxruntime")
+            return
+        if self._camera_scan_active:
+            # A background camera probe is using the DirectShow/MSMF backend
+            # right now; opening the real capture at the same time is what
+            # causes the driver to wedge, so wait for the scan to finish.
+            self.webcam_status_var.set("Waiting for camera scan to finish…")
+            self._pending_webcam_start = True
+            return
+        if self._webcam_connecting:
+            return
+        cam = self._current_cam_index()
+        if cam is None:
+            if show_error:
+                messagebox.showerror("Webcam OCR failed",
+                                     f"Invalid camera selection: {self.webcam_cam_var.get()!r}")
+            return
+        cam_name = self._current_cam_name()
+
+        self._stop_ocr()
+        if self.webcam_ocr:
+            self.webcam_ocr.stop()
+            self.webcam_ocr = None
+
+        try:
+            latency_ms = float(self.webcam_latency_var.get())
+        except ValueError:
+            latency_ms = None
+        x1, y1, x2, y2 = self._webcam_roi
+
+        # Opening the camera and loading the OCR model can take several
+        # seconds (some virtual-cam drivers are especially slow to spin up),
+        # and both happen inside WebcamOCR.start(). Running that on the main
+        # thread would freeze the whole GUI for the duration, so it's done
+        # in a background thread and the result is applied back via `after`.
+        self._webcam_connecting = True
+        self._webcam_connect_token += 1
+        token = self._webcam_connect_token
+        self.webcam_start_btn_var.set("Connecting…")
+        self.webcam_status_var.set(f"Connecting to camera {cam}…")
+
+        def worker():
+            try:
+                wc = WebcamOCR(cam_index=cam)
+                if latency_ms is not None:
+                    wc.camera_latency_ms = latency_ms
+                wc.roi.x1 = x1
+                wc.roi.y1 = y1
+                wc.roi.x2 = x2
+                wc.roi.y2 = y2
+                wc.on_reading = self._on_ocr_reading
+                wc.start()
+            except Exception as exc:
+                self.after(0, lambda: self._on_webcam_connect_failed(token, exc, show_error))
+                return
+            self.after(0, lambda: self._on_webcam_connected(token, wc, cam, cam_name, remember))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_webcam_connected(self, token, wc, cam, cam_name, remember=False):
+        self._webcam_connecting = False
+        if token != self._webcam_connect_token:
+            # A stop/switch happened while this connect was in flight;
+            # this result is stale, so discard the camera it opened.
+            wc.stop()
+            return
+        self.webcam_ocr = wc
+        if remember and cam_name and self._camera_prefs.get("camera_name") != cam_name:
+            # Only an explicit user selection updates the saved default.
+            # Auto-connect fallbacks must never overwrite it — that was how
+            # the integrated camera silently replaced the preferred camera.
+            self._camera_prefs["camera_name"] = cam_name
+            save_camera_prefs(cam_name)
+        # Sync lag = camera latency. The OCR pc_time is when the
+        # frame arrived on the PC; the display showed that number
+        # camera_latency_ms earlier.
+        cam_ms = wc.camera_latency_ms
+        self.sync_lag_seconds = cam_ms / 1000.0
+        self.sync_confidence = 1.0
+        self.sync_status_var.set(f"Sync: webcam (lag {cam_ms:.0f} ms)")
+        self.webcam_start_btn_var.set("Stop Webcam OCR")
+        self.webcam_status_var.set(f"Webcam OCR running (cam {cam})")
+        self.ocr_source_var.set("webcam")
+        self.ocr_button_var.set("Start OCR")
+
+    def _on_webcam_connect_failed(self, token, exc, show_error=True):
+        self._webcam_connecting = False
+        if token != self._webcam_connect_token:
+            return
+        self.webcam_start_btn_var.set("Start Webcam OCR")
+        self.webcam_status_var.set(f"Webcam error: {exc}")
+        if show_error:
+            messagebox.showerror("Webcam OCR failed", str(exc))
+
+    def _reconnect_to_default(self):
+        """Rescan cameras, then (re)connect to the saved default by name."""
+        def after_scan():
+            preferred = self._camera_prefs.get("camera_name") or DEFAULT_CAMERA_NAME
+            label = self._label_for_camera_name(preferred)
+            if label is not None:
+                self.webcam_cam_var.set(label)
+                self._start_webcam_ocr()
+            else:
+                self.webcam_status_var.set(
+                    f"Default camera '{preferred}' not found — check its USB "
+                    "connection, or pick a camera in Settings to make it the new default.")
+
+        self._refresh_camera_list(then=after_scan)
+
+    def _stop_webcam_ocr(self):
+        self._webcam_connect_token += 1
+        self._webcam_connecting = False
+        if self.webcam_ocr:
+            self.webcam_ocr.stop()
+            self.webcam_ocr = None
+        self.webcam_start_btn_var.set("Start Webcam OCR")
+        self.webcam_status_var.set("Webcam OCR stopped")
+        self.webcam_ms_var.set("--")
+        self.webcam_reading_var.set("--")
+
+    def _webcam_reset_roi(self, event=None):
+        if self.webcam_ocr and self.webcam_ocr.last_frame is not None:
+            h, w = self.webcam_ocr.last_frame.shape[:2]
+            self._webcam_roi = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
+        else:
+            self._webcam_roi = (540, 322, 740, 397)
+        if self.webcam_ocr:
+            x1, y1, x2, y2 = self._webcam_roi
+            self.webcam_ocr.roi.x1 = x1
+            self.webcam_ocr.roi.y1 = y1
+            self.webcam_ocr.roi.x2 = x2
+            self.webcam_ocr.roi.y2 = y2
+
     def _build_connection_tab(self, root):
         pad = {"padx": 10, "pady": 8}
 
@@ -754,6 +1267,46 @@ class App(tk.Tk):
         ttk.Button(box, text="Apply", command=self._apply_poll_rate).grid(row=2, column=2, sticky="w", padx=6)
 
         ttk.Label(box, textvariable=self.status_var).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(12, 6))
+
+        webcam_box = ttk.LabelFrame(root, text="Webcam OCR")
+        webcam_box.pack(fill="x", **pad)
+
+        ttk.Radiobutton(webcam_box, text="iPhone (UDP stream)",
+                        variable=self.ocr_source_var, value="phone",
+                        command=self._on_ocr_source_change).grid(
+            row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Radiobutton(webcam_box, text="Webcam (local OCR)",
+                        variable=self.ocr_source_var, value="webcam",
+                        command=self._on_ocr_source_change).grid(
+            row=0, column=1, sticky="w", padx=6, pady=4)
+
+        ttk.Label(webcam_box, text="Camera").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        self.settings_cam_combo = ttk.Combobox(
+            webcam_box, textvariable=self.webcam_cam_var,
+            values=["0", "1", "2", "3"],
+            state="readonly", width=24, font=("Segoe UI", 9))
+        self.settings_cam_combo.grid(row=1, column=1, sticky="w", pady=6)
+        self.settings_cam_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_camera_selected())
+        ttk.Button(webcam_box, text="Refresh Cameras", command=self._reconnect_to_default).grid(
+            row=1, column=2, sticky="w", padx=6)
+
+        ttk.Label(webcam_box, text="Cam Latency (ms)").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        latency_entry = ttk.Entry(webcam_box, textvariable=self.webcam_latency_var, width=8)
+        latency_entry.grid(row=2, column=1, sticky="w", pady=6)
+        latency_entry.bind("<Return>", lambda _e: self._apply_webcam_latency())
+        latency_entry.bind("<FocusOut>", lambda _e: self._apply_webcam_latency())
+        ttk.Button(webcam_box, textvariable=self.webcam_start_btn_var,
+                   command=self._toggle_webcam_ocr).grid(row=2, column=2, sticky="w", padx=6)
+
+        webcam_status_frame = ttk.Frame(webcam_box)
+        webcam_status_frame.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(6, 4))
+        ttk.Label(webcam_status_frame, textvariable=self.webcam_status_var).pack(side="left")
+        ttk.Label(webcam_status_frame, text="  |  OCR:").pack(side="left", padx=(12, 2))
+        ttk.Label(webcam_status_frame, textvariable=self.webcam_ms_var,
+                  font=("Consolas", 10)).pack(side="left")
+        ttk.Label(webcam_status_frame, text="  |  Reading:").pack(side="left", padx=(12, 2))
+        ttk.Label(webcam_status_frame, textvariable=self.webcam_reading_var,
+                  font=("Consolas", 12, "bold")).pack(side="left")
 
         gps_box = ttk.LabelFrame(root, text="Gravity / GPS")
         gps_box.pack(fill="x", **pad)
@@ -965,9 +1518,6 @@ class App(tk.Tk):
         self.report_tree.configure(yscrollcommand=scrollbar.set)
         self.report_tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-
-        self.report_tree.bind("<<TreeviewOpen>>", lambda _e: self._on_report_expand())
-        self.report_tree.bind("<<TreeviewClose>>", lambda _e: None)
 
     def _add_to_report(self):
         if not self._has_capture_data():
@@ -1203,25 +1753,11 @@ class App(tk.Tk):
         self.live_error_label.pack(anchor="w")
         parent.columnconfigure(0, weight=1)
 
-    def _big_label(self, parent, title: str, var: tk.StringVar, row: int):
-        card = ttk.Frame(parent)
-        card.grid(row=row, column=0, sticky="ew", padx=12, pady=(14, 0))
-        ttk.Label(card, text=title, style="LiveTitle.TLabel").pack(anchor="w")
-        ttk.Label(card, textvariable=var, style="BigValue.TLabel").pack(anchor="w")
-        parent.columnconfigure(0, weight=1)
-
     def _small_label(self, parent, title: str, var: tk.StringVar, row: int):
         card = ttk.Frame(parent)
         card.grid(row=row, column=0, sticky="ew", padx=12, pady=(8, 0))
         ttk.Label(card, text=title, font=("Segoe UI", 10, "bold")).pack(anchor="w")
         ttk.Label(card, textvariable=var, style="SmallValue.TLabel").pack(anchor="w")
-        parent.columnconfigure(0, weight=1)
-
-    def _tiny_label(self, parent, title: str, var: tk.StringVar, row: int):
-        card = ttk.Frame(parent)
-        card.grid(row=row, column=0, sticky="ew", padx=12, pady=(2, 0))
-        ttk.Label(card, text=title, font=("Segoe UI", 8)).pack(anchor="w")
-        ttk.Label(card, textvariable=var, style="TinyValue.TLabel").pack(anchor="w")
         parent.columnconfigure(0, weight=1)
 
     def _refresh_ports(self):
@@ -1455,13 +1991,54 @@ class App(tk.Tk):
         self.overload_badge.configure(style=style)
         self._overload_flash_id = self.after(500, self._overload_flash_tick)
 
-    def _auto_connect_on_launch(self):
-        if not self.ocr:
+    def _label_for_camera_name(self, name: str) -> Optional[str]:
+        for value in self.settings_cam_combo["values"]:
+            if value.split(":", 1)[-1].strip() == name:
+                return value
+        return None
+
+    def _auto_connect_on_launch(self, attempt: int = 1):
+        if WebcamOCR is not None and _HAS_WEBCAM_DEPS:
+            preferred = self._camera_prefs.get("camera_name") or DEFAULT_CAMERA_NAME
+            label = self._label_for_camera_name(preferred)
+            if label is not None:
+                self.webcam_cam_var.set(label)
+                # Quiet on launch: a busy camera shows in the status label
+                # instead of popping an error dialog before the UI settles.
+                self._start_webcam_ocr(show_error=False)
+            elif attempt < 3:
+                # USB cameras can enumerate late after boot/replug, so rescan
+                # before giving up on the saved default.
+                self.webcam_status_var.set(
+                    f"Looking for default camera '{preferred}' (scan {attempt + 1}/3)…")
+                self.after(3000, lambda: self._refresh_camera_list(
+                    then=lambda: self._auto_connect_on_launch(attempt + 1)))
+            else:
+                # Never silently connect to a different camera than the saved
+                # default — that reads as "it ignored my selection".
+                self.webcam_status_var.set(
+                    f"Default camera '{preferred}' not found — check its USB "
+                    "connection, then press Refresh, or pick a camera in Settings.")
+        elif not self.ocr:
             self._start_ocr(show_error=False)
         self._kick_auto_scan()
 
     def _set_hadi_light(self, color: str):
         self.hadi_status_light.itemconfig(self._hadi_light_id, fill=color)
+
+    def _update_hadi_light(self, now_pc: float):
+        """HADI light: flashing red while trying to connect, yellow when
+        connected but no data yet, green while readings are flowing."""
+        if not self.hadi.is_connected():
+            if self._auto_scan_active:
+                flash_on = int(now_pc / 0.4) % 2 == 0
+                self._set_hadi_light("#cc0000" if flash_on else "#4d0000")
+            else:
+                self._set_hadi_light("#cc0000")
+        elif self._hadi_is_fresh(now_pc):
+            self._set_hadi_light("#00aa00")
+        else:
+            self._set_hadi_light("#ccaa00")
 
     def _set_ocr_light(self, color: str):
         self.ocr_status_light.itemconfig(self._ocr_light_id, fill=color)
@@ -1470,7 +2047,7 @@ class App(tk.Tk):
         self._ocr_last_packet_pc = time.perf_counter()
 
     def _update_ocr_light(self, now_pc: float):
-        if not self.ocr:
+        if not self.ocr and not self.webcam_ocr:
             self._set_ocr_light("#cc0000")
             return
         stale = 3.0
@@ -1496,8 +2073,10 @@ class App(tk.Tk):
             return
         self._last_auto_scan = now
         self.status_var.set("HADI: scanning ports...")
-        self._set_hadi_light("#ccaa00")
-        baud = int(self.baud_var.get())
+        try:
+            baud = int(self.baud_var.get())
+        except ValueError:
+            baud = 19200
         self._scan_thread = threading.Thread(
             target=self._background_scan, args=(baud,), daemon=True)
         self._scan_thread.start()
@@ -1519,7 +2098,6 @@ class App(tk.Tk):
 
     def _on_scan_failed(self):
         self.status_var.set("HADI: no device found, retrying...")
-        self._set_hadi_light("#cc0000")
 
     def _auto_connect_port(self, port: str):
         if self.hadi.is_connected():
@@ -1533,10 +2111,8 @@ class App(tk.Tk):
             self._apply_poll_rate()
             self.hadi_button_var.set("Disconnect HADI")
             self._last_good_port = port
-            self._set_hadi_light("#00aa00")
             self.status_var.set(f"HADI connected on {port}")
         except Exception:
-            self._set_hadi_light("#cc0000")
             self.status_var.set(f"HADI: probe OK but connect failed on {port}")
 
     def _toggle_hadi(self):
@@ -1562,10 +2138,8 @@ class App(tk.Tk):
             self.hadi_button_var.set("Disconnect HADI")
             self._last_good_port = self.port_var.get()
             self._auto_scan_active = True
-            self._set_hadi_light("#00aa00")
             self.status_var.set(f"HADI connected on {self.port_var.get()}")
         except Exception as exc:
-            self._set_hadi_light("#cc0000")
             self.status_var.set(f"HADI waiting: {exc}")
             if show_error:
                 messagebox.showerror("HADI connection failed", str(exc))
@@ -1573,7 +2147,6 @@ class App(tk.Tk):
     def _disconnect_hadi(self):
         self.hadi.disconnect()
         self.hadi_button_var.set("Connect HADI")
-        self._set_hadi_light("#cc0000")
         self.status_var.set("HADI disconnected")
         self.latest_hadi = None
         self.hadi_last_pc_time = None
@@ -1768,9 +2341,13 @@ class App(tk.Tk):
 
     def _on_ocr_reading(self, reading):
         now_pc = time.perf_counter()
+        # Use frame capture time if available (webcam OCR), otherwise use
+        # arrival time (iPhone UDP). This aligns the OCR reading with when
+        # the display was actually photographed, not when OCR finished.
+        effective_pc = getattr(reading, "capture_pc", None) or now_pc
         sample = OCRTimedReading(
             value=reading.value,
-            pc_time=now_pc,
+            pc_time=effective_pc,
             wall_time=reading.received_at,
             phone_time=reading.timestamp,
             raw_text=getattr(reading, "raw_text", "") or f"{reading.value:g}",
@@ -1836,6 +2413,24 @@ class App(tk.Tk):
         self.w_button_var.set(f"SELECT / UNSELECT W    MF {val:.7f}")
 
     @staticmethod
+    def _interp_at(times, values, t):
+        """Linear interpolation over parallel (sorted times, values) lists.
+
+        Bisect-based so the sync-lag search stays cheap: it evaluates this
+        thousands of times per estimator tick on the UI thread.
+        """
+        if len(times) < 2 or t < times[0] or t > times[-1]:
+            return None
+        i = bisect.bisect_left(times, t)
+        if i == 0:
+            return values[0]
+        span = times[i] - times[i - 1]
+        if span <= 0:
+            return values[i]
+        f = (t - times[i - 1]) / span
+        return values[i - 1] + (values[i] - values[i - 1]) * f
+
+    @staticmethod
     def _interp(samples, t, attr):
         if len(samples) < 2 or t < samples[0].pc_time or t > samples[-1].pc_time:
             return None
@@ -1862,15 +2457,6 @@ class App(tk.Tk):
         if abs(nearest_time - target_time) > max_age_seconds:
             return None
         return nearest
-
-    def _nearest_sample_value(self, samples, target_time, attr, corrected_ocr=False, max_age_seconds=0.75):
-        """Return the exact value from the nearest real sample.
-
-        This is intentionally used for OCR so the app never invents in-between
-        display values like 10.0473 when the phone only saw 10.0 or 10.1.
-        """
-        nearest = self._nearest_sample(samples, target_time, corrected_ocr, max_age_seconds)
-        return None if nearest is None else getattr(nearest, attr)
 
     @staticmethod
     def _corr(xs, ys):
@@ -1921,17 +2507,26 @@ class App(tk.Tk):
 
         # When calibration is set, search a narrow window around it with
         # finer steps.  Otherwise scan the full ±500 ms range.
-        cal = self.calibration_lag_seconds
+        # The calibration anchor was measured for the iPhone pipeline; in
+        # webcam mode the camera latency is the starting point instead, so
+        # ignore the anchor and refine around the current lag.
+        cal = 0.0 if self.webcam_ocr else self.calibration_lag_seconds
         if cal > 0:
             center_ms = int(round(cal * 1000.0))
             search_range = range(center_ms - 200, center_ms + 201, 10)
+        elif self.webcam_ocr:
+            center_ms = int(round(self.sync_lag_seconds * 1000.0))
+            search_range = range(center_ms - 250, center_ms + 251, 10)
         else:
             search_range = range(-500, 501, 25)
 
+        hadi_t = [s.pc_time for s in hadi]
+        ocr_t = [s.pc_time for s in ocr]
+
         for lag_ms in search_range:
             lag = lag_ms / 1000.0
-            t0 = max(hadi[0].pc_time, ocr[0].pc_time - lag)
-            t1 = min(hadi[-1].pc_time, ocr[-1].pc_time - lag)
+            t0 = max(hadi_t[0], ocr_t[0] - lag)
+            t1 = min(hadi_t[-1], ocr_t[-1] - lag)
             if t1 - t0 < 1.0:
                 continue
 
@@ -1939,8 +2534,8 @@ class App(tk.Tk):
             ys = []
             t = t0
             while t <= t1:
-                hv = self._interp(hadi, t, "force_lbf")
-                ov = self._interp(ocr, t + lag, "value")
+                hv = self._interp_at(hadi_t, h_vals, t)
+                ov = self._interp_at(ocr_t, o_vals, t + lag)
                 if hv is not None and ov is not None:
                     xs.append(hv)
                     ys.append(ov)
@@ -1963,8 +2558,19 @@ class App(tk.Tk):
             if cal > 0:
                 self.sync_lag_seconds = 0.95 * self.sync_lag_seconds + 0.05 * cal
             self.sync_confidence = best_corr
-            save_sync_state(self.sync_lag_seconds * 1000.0, self.sync_confidence,
-                            calibration_lag_ms=cal * 1000.0)
+            # Persist at most every 10 s (or on a >2 ms change) instead of every
+            # estimator tick — this runs once a second and was rewriting the
+            # file constantly for sub-millisecond drift.
+            last_saved = getattr(self, "_last_sync_save", None)
+            lag_ms = self.sync_lag_seconds * 1000.0
+            if (last_saved is None
+                    or now_pc - last_saved[0] >= 10.0
+                    or abs(lag_ms - last_saved[1]) > 2.0):
+                # Preserve the stored (iPhone) calibration anchor even while
+                # webcam mode estimates with the anchor disabled.
+                save_sync_state(lag_ms, self.sync_confidence,
+                                calibration_lag_ms=self.calibration_lag_seconds * 1000.0)
+                self._last_sync_save = (now_pc, lag_ms)
 
         cal_note = f" | cal {cal*1000:+.0f}" if cal > 0 else ""
         self.sync_status_var.set(
@@ -2033,6 +2639,18 @@ class App(tk.Tk):
         self._ocr_overload_text = ""
 
     def _ui_tick(self):
+        # This loop drives every live display update. If an exception ever
+        # escaped it, the `after` reschedule would never run and the whole UI
+        # would freeze permanently, so the body is guarded and the reschedule
+        # is in a finally block.
+        try:
+            self._ui_tick_body()
+        except Exception:
+            pass
+        finally:
+            self.after(50, self._ui_tick)
+
+    def _ui_tick_body(self):
         now_pc = time.perf_counter()
         got_hadi = False
 
@@ -2043,7 +2661,6 @@ class App(tk.Tk):
                 break
             if isinstance(item, Exception):
                 self.status_var.set(f"HADI error: {item}")
-                self._set_hadi_light("#cc0000")
                 self.hadi_last_pc_time = None
                 self._set_hadi_waiting_display()
                 if self._auto_scan_active:
@@ -2067,7 +2684,7 @@ class App(tk.Tk):
         if not got_hadi and not self._hadi_is_fresh(now_pc):
             self._set_hadi_waiting_display()
 
-        if self.ocr:
+        if self.ocr or self.webcam_ocr:
             with self.ocr_lock:
                 r = self.latest_ocr
             if r is None or not self._ocr_is_fresh(now_pc):
@@ -2082,6 +2699,7 @@ class App(tk.Tk):
         else:
             self._set_ocr_waiting_display()
 
+        self._update_hadi_light(now_pc)
         self._update_ocr_light(now_pc)
 
         self._update_ocr_overload_warning()
@@ -2092,8 +2710,6 @@ class App(tk.Tk):
 
         if self._auto_scan_active and not self.hadi.is_connected():
             self._kick_auto_scan()
-
-        self.after(50, self._ui_tick)
 
     def _tree_for_run(self, run: int):
         return self.run1_tree if run == 1 else self.run2_tree
@@ -2322,15 +2938,6 @@ class App(tk.Tk):
         )
 
     @staticmethod
-    def _format_run_value(run_row, key, fmt):
-        if not run_row or run_row.get(key) is None:
-            return ""
-        try:
-            return format(float(run_row.get(key)), fmt)
-        except Exception:
-            return ""
-
-    @staticmethod
     def _format_run_percent(run_row):
         if not run_row:
             return ""
@@ -2412,12 +3019,6 @@ class App(tk.Tk):
         self.target_var.set(f"Next: P{index + 1} R{run}")
         self._update_target_force_display()
         self._refresh_row_tags()
-
-    def _select_target_row(self, index: Optional[int]):
-        if index is None:
-            self._select_target(None, self.capture_target_run)
-            return
-        self._select_target(index, self.capture_target_run)
 
     def _refresh_row_tags(self):
         if not hasattr(self, "run1_tree"):
@@ -2735,11 +3336,6 @@ class App(tk.Tk):
         self.focus_set()
         return "break"
 
-    def _clear_override_selection(self, update_tree=True):
-        run = self.capture_target_run if self.capture_target_run in (1, 2) else 1
-        next_empty = self._first_empty_from(0, run)
-        self._select_target(*(next_empty if next_empty is not None else (None, run)))
-
     def _error_row_tag(self, row: dict) -> str:
         if row is None:
             return ""
@@ -2826,29 +3422,6 @@ class App(tk.Tk):
 
     def _run_has_data(self, run_key: str) -> bool:
         return any((row.get(run_key) is not None) for row in self.capture_rows)
-
-    def _capture_csv_rows_for_run(self, run_key: str):
-        rows = []
-        for point_row in self.capture_rows:
-            run_row = point_row.get(run_key)
-            if not run_row:
-                continue
-            hadi_text = ""
-            hadi_lbf = run_row.get("hadi_lbf")
-            if hadi_lbf not in (None, ""):
-                try:
-                    _raw = run_row.get("hadi_raw")
-                    _raw_f = float(_raw) if _raw not in (None, "") else None
-                    display_val = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=_raw_f)
-                    hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False)
-                except (TypeError, ValueError):
-                    pass
-            rows.append([
-                self._ocr_text_for_row(run_row, show_plus=False),
-                hadi_text,
-                self._csv_fmt_error(run_row.get("percent_error"), run_row.get("percent_error_na", False)),
-            ])
-        return rows
 
     def _csv_row_for_point(self, run_key: str, point_row: dict):
         run_row = point_row.get(run_key)
@@ -3676,15 +4249,34 @@ class App(tk.Tk):
 
         hadi_samples = [s for s in self.hadi_buffer if s.pc_time >= window_start]
         with self.ocr_lock:
-            ocr_samples = [s for s in self.ocr_buffer if s.pc_time >= window_start]
+            ocr_samples = [s for s in self.ocr_buffer
+                           if self._corrected_ocr_time(s) >= window_start]
 
         if not hadi_samples or not ocr_samples:
             self.auto_capture_status_var.set("Auto-capture: not enough samples")
             return
 
-        hadi_lbf = statistics.median(s.force_lbf for s in hadi_samples)
-        hadi_raw = statistics.median(s.raw_response for s in hadi_samples)
-        ocr_value = statistics.median(s.value for s in ocr_samples)
+        pairs = []
+        for ocr_s in ocr_samples:
+            ocr_t = self._corrected_ocr_time(ocr_s)
+            nearest_hadi = min(hadi_samples, key=lambda h: abs(h.pc_time - ocr_t))
+            gap = abs(nearest_hadi.pc_time - ocr_t)
+            pairs.append((gap, nearest_hadi, ocr_s))
+
+        if not pairs:
+            self.auto_capture_status_var.set("Auto-capture: no matched pairs")
+            return
+
+        pairs.sort(key=lambda p: p[0])
+        best_gap = pairs[0][0]
+        threshold = max(best_gap * 2, 0.060)
+        tight = [(h, o) for g, h, o in pairs if g <= threshold]
+        if len(tight) < 3:
+            tight = [(h, o) for _, h, o in pairs[:max(3, len(pairs))]]
+
+        hadi_lbf = statistics.median(h.force_lbf for h, _ in tight)
+        hadi_raw = statistics.median(h.raw_response for h, _ in tight)
+        ocr_value = statistics.median(o.value for _, o in tight)
         ocr_text = f"{ocr_value:.10g}"
 
         if self.flip_sign_var.get():
@@ -3699,7 +4291,7 @@ class App(tk.Tk):
             "time": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
             "load_cell": self.selected_load_cell_name.get(),
             "mode": self.mode_var.get(),
-            "method": f"auto_capture_median_{dwell_seconds:.1f}s",
+            "method": f"auto_median_{len(tight)}_pairs",
             "sync_mode": "auto",
             "sync_lag_ms": self.sync_lag_seconds * 1000.0,
             "sync_confidence": self.sync_confidence,
@@ -3741,6 +4333,11 @@ class App(tk.Tk):
             return "break"
         if self.notebook.index(self.notebook.select()) != 0:
             return
+        # Key auto-repeat (holding space) would otherwise queue a capture per
+        # repeat event, stamping the same reading into several rows.
+        if getattr(self, "_manual_capture_pending", False):
+            return "break"
+        self._manual_capture_pending = True
         self.focus_set()
         try:
             half_window = float(self.manual_median_window_var.get())
@@ -3752,6 +4349,7 @@ class App(tk.Tk):
         return "break"
 
     def _capture_manual_median(self):
+        self._manual_capture_pending = False
         press_pc = getattr(self, "_manual_median_press_time", None)
         if press_pc is None:
             return
@@ -3770,16 +4368,38 @@ class App(tk.Tk):
 
         hadi_samples = [s for s in self.hadi_buffer if window_start <= s.pc_time <= window_end]
         with self.ocr_lock:
-            ocr_samples = [s for s in self.ocr_buffer if window_start <= s.pc_time <= window_end]
+            ocr_samples = [s for s in self.ocr_buffer
+                           if window_start <= self._corrected_ocr_time(s) <= window_end]
 
         if not hadi_samples or not ocr_samples:
             self._capture()
             return
 
+        # Pair each OCR sample with its closest HADI sample in time,
+        # keep all pairs with a tight gap, then median to filter misreads.
+        pairs = []
+        for ocr_s in ocr_samples:
+            ocr_t = self._corrected_ocr_time(ocr_s)
+            nearest_hadi = min(hadi_samples, key=lambda h: abs(h.pc_time - ocr_t))
+            gap = abs(nearest_hadi.pc_time - ocr_t)
+            pairs.append((gap, nearest_hadi, ocr_s))
+
+        if not pairs:
+            self._capture()
+            return
+
+        pairs.sort(key=lambda p: p[0])
+        # Use all pairs within 2x of the best gap (at least 3 pairs)
+        best_gap = pairs[0][0]
+        threshold = max(best_gap * 2, 0.060)
+        tight = [(h, o) for g, h, o in pairs if g <= threshold]
+        if len(tight) < 3:
+            tight = [(h, o) for _, h, o in pairs[:max(3, len(pairs))]]
+
         now_wall = time.time()
-        hadi_lbf = statistics.median(s.force_lbf for s in hadi_samples)
-        hadi_raw = statistics.median(s.raw_response for s in hadi_samples)
-        ocr_value = statistics.median(s.value for s in ocr_samples)
+        hadi_lbf = statistics.median(h.force_lbf for h, _ in tight)
+        hadi_raw = statistics.median(h.raw_response for h, _ in tight)
+        ocr_value = statistics.median(o.value for _, o in tight)
         ocr_text = f"{ocr_value:.10g}"
 
         if self.flip_sign_var.get():
@@ -3789,12 +4409,17 @@ class App(tk.Tk):
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
         percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
 
+        self.status_var.set(
+            f"Capture: {len(tight)} pairs (gap<={threshold*1000:.0f}ms) | "
+            f"HADI={hadi_display:.5g} OCR={ocr_value:.5g}"
+        )
+
         row = {
             "point": (self.capture_target_index + 1) if self.capture_target_index is not None else "",
             "time": datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds"),
             "load_cell": self.selected_load_cell_name.get(),
             "mode": self.mode_var.get(),
-            "method": f"manual_median_{half_window*2:.1f}s",
+            "method": f"median_{len(tight)}_pairs",
             "sync_mode": "manual" if self.sync_manual else "auto",
             "sync_lag_ms": self.sync_lag_seconds * 1000.0,
             "sync_confidence": self.sync_confidence,
@@ -3925,7 +4550,7 @@ class App(tk.Tk):
             ):
                 return
 
-        count = len(self.capture_rows) if self.capture_rows else 10
+        count = len(self.capture_rows) if self.capture_rows else 11
         self._initialize_point_rows(count)
         self.dirty_data = False
         self.autosave_name = None
@@ -3946,6 +4571,7 @@ class App(tk.Tk):
 
         self.hadi.disconnect()
         self._stop_ocr()
+        self._stop_webcam_ocr()
         self.destroy()
 
 
