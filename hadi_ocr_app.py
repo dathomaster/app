@@ -598,7 +598,6 @@ class App(tk.Tk):
         self.notebook.add(self.capture_tab, text="Capture")
         self.notebook.add(self.load_cells_tab, text="Load Cells")
         self.notebook.add(self.converter_tab, text="Converter")
-        self.notebook.add(self.report_tab, text="Report")
         self.notebook.add(self.connection_tab, text="Settings")
 
         self._build_capture_tab(self.capture_tab)
@@ -1245,6 +1244,16 @@ class App(tk.Tk):
     def _build_connection_tab(self, root):
         pad = {"padx": 10, "pady": 8}
 
+        gps_box = ttk.LabelFrame(root, text="Gravity / GPS")
+        gps_box.pack(fill="x", **pad)
+        ttk.Label(gps_box, textvariable=self.gps_status_var).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=6)
+        ttk.Label(gps_box, text="MF Override").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        mf_entry = ttk.Entry(gps_box, textvariable=self.mf_override_var, width=12)
+        mf_entry.grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Button(gps_box, text="Apply", command=self._apply_mf_override).grid(row=1, column=2, sticky="w", padx=6)
+        ttk.Label(gps_box, text="Leave blank to use GPS (or 1.0 if no GPS)").grid(
+            row=1, column=3, sticky="w", padx=(10, 6), pady=6)
+
         box = ttk.LabelFrame(root, text="Detailed Connections")
         box.pack(fill="x", **pad)
 
@@ -1307,16 +1316,6 @@ class App(tk.Tk):
         ttk.Label(webcam_status_frame, text="  |  Reading:").pack(side="left", padx=(12, 2))
         ttk.Label(webcam_status_frame, textvariable=self.webcam_reading_var,
                   font=("Consolas", 12, "bold")).pack(side="left")
-
-        gps_box = ttk.LabelFrame(root, text="Gravity / GPS")
-        gps_box.pack(fill="x", **pad)
-        ttk.Label(gps_box, textvariable=self.gps_status_var).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=6)
-        ttk.Label(gps_box, text="MF Override").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        mf_entry = ttk.Entry(gps_box, textvariable=self.mf_override_var, width=12)
-        mf_entry.grid(row=1, column=1, sticky="w", pady=6)
-        ttk.Button(gps_box, text="Apply", command=self._apply_mf_override).grid(row=1, column=2, sticky="w", padx=6)
-        ttk.Label(gps_box, text="Leave blank to use GPS (or 1.0 if no GPS)").grid(
-            row=1, column=3, sticky="w", padx=(10, 6), pady=6)
 
         sync_box = ttk.LabelFrame(root, text="Sync Calibration")
         sync_box.pack(fill="x", **pad)
@@ -3487,27 +3486,35 @@ class App(tk.Tk):
             if has_run1 and has_run2:
                 writer.writerow([f"Run 1 ({units})", "", "", "", f"Run 2 ({units})"])
                 writer.writerow(fields + [""] + fields)
-                for point_row in self.capture_rows:
-                    r1 = self._csv_row_for_point("run1", point_row)
-                    r2 = self._csv_row_for_point("run2", point_row)
+                rows = [
+                    (self._csv_row_for_point("run1", point_row), self._csv_row_for_point("run2", point_row))
+                    for point_row in self.capture_rows
+                ]
+                last_idx = max(
+                    (i for i, (r1, r2) in enumerate(rows) if r1 != ["", "", ""] or r2 != ["", "", ""]),
+                    default=-1,
+                )
+                for r1, r2 in rows[:last_idx + 1]:
+                    writer.writerow(r1 + [""] + r2)
                     if r1 != ["", "", ""] or r2 != ["", "", ""]:
-                        writer.writerow(r1 + [""] + r2)
                         total_rows += 1
             elif has_run1:
                 writer.writerow([f"Run 1 ({units})"])
                 writer.writerow(fields)
-                for point_row in self.capture_rows:
-                    r1 = self._csv_row_for_point("run1", point_row)
+                rows = [self._csv_row_for_point("run1", point_row) for point_row in self.capture_rows]
+                last_idx = max((i for i, r1 in enumerate(rows) if r1 != ["", "", ""]), default=-1)
+                for r1 in rows[:last_idx + 1]:
+                    writer.writerow(r1)
                     if r1 != ["", "", ""]:
-                        writer.writerow(r1)
                         total_rows += 1
             elif has_run2:
                 writer.writerow([f"Run 2 ({units})"])
                 writer.writerow(fields)
-                for point_row in self.capture_rows:
-                    r2 = self._csv_row_for_point("run2", point_row)
+                rows = [self._csv_row_for_point("run2", point_row) for point_row in self.capture_rows]
+                last_idx = max((i for i, r2 in enumerate(rows) if r2 != ["", "", ""]), default=-1)
+                for r2 in rows[:last_idx + 1]:
+                    writer.writerow(r2)
                     if r2 != ["", "", ""]:
-                        writer.writerow(r2)
                         total_rows += 1
 
         return total_rows
@@ -4568,7 +4575,7 @@ class App(tk.Tk):
         self.last_manual_save_path = Path(path)
         self.dirty_data = False
         self._add_to_report()
-        messagebox.showinfo("Saved", f"Saved {row_count} rows to:\n{path}\n\nRun added to Report tab.")
+        messagebox.showinfo("Saved", f"Saved {row_count} rows to:\n{path}")
         return True
 
     def _clear_captures(self):
