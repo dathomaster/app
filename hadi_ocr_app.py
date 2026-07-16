@@ -555,6 +555,7 @@ class App(tk.Tk):
         self.cell_name_var = tk.StringVar()
         self.capacity_var = tk.StringVar()
         self.coeff_vars: dict[str, tk.StringVar] = {}
+        self.in_use_cell_var = tk.StringVar(value="")
 
         self._setup_styles()
         self._build_ui()
@@ -579,8 +580,8 @@ class App(tk.Tk):
         style.configure("TinyValue.TLabel", font=("Consolas", 9))
         style.configure("ModeBadgeCompression.TLabel", font=("Segoe UI", 12, "bold"), foreground="#0f5f5c", background="#d7f4f1", padding=(18, 10))
         style.configure("ModeBadgeTension.TLabel", font=("Segoe UI", 12, "bold"), foreground="#5b2a86", background="#efe3fb", padding=(18, 10))
-        style.configure("OverloadBadge.TLabel", font=("Segoe UI", 11, "bold"), foreground="#ffffff", background="#c1121f", padding=(120, 6))
-        style.configure("OverloadBadgeHidden.TLabel", font=("Segoe UI", 11, "bold"), foreground="#c1121f", background="#c1121f", padding=(120, 6))
+        style.configure("OverloadBadge.TLabel", font=("Segoe UI", 13, "bold"), foreground="#ffffff", background="#c1121f", padding=(48, 11))
+        style.configure("OverloadBadgeHidden.TLabel", font=("Segoe UI", 13, "bold"), foreground="#c1121f", background="#c1121f", padding=(48, 11))
         style.configure("Zero.TButton", font=("Segoe UI", 9, "bold"))
         style.configure("Override.TButton", font=("Segoe UI", 10, "bold"), padding=(10, 6))
         style.configure("BigCapture.TButton", font=("Segoe UI", 12, "bold"), padding=(14, 8))
@@ -605,6 +606,8 @@ class App(tk.Tk):
         self._build_load_cells_tab(self.load_cells_tab)
         self._build_converter_tab(self.converter_tab)
         self._build_report_tab(self.report_tab)
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_capture_tab(self, root):
         pad = {"padx": 10, "pady": 8}
@@ -645,6 +648,7 @@ class App(tk.Tk):
         decimals.bind("<<ComboboxSelected>>", lambda _e: self._set_hadi_display_options())
 
         mode_bar = ttk.Frame(top_section)
+        self._mode_bar = mode_bar
 
         def _position_mode_bar(_e=None):
             mode_bar.place(in_=top_section, relx=0.5, anchor="n",
@@ -656,7 +660,10 @@ class App(tk.Tk):
         mode_bar.columnconfigure(1, weight=0)
         mode_bar.columnconfigure(2, weight=1)
         self.overload_badge_var = tk.StringVar(value="")
-        self.overload_badge = ttk.Label(mode_bar, textvariable=self.overload_badge_var, style="OverloadBadge.TLabel")
+        # Parented to top_section (not mode_bar) so the full-width banner isn't
+        # clipped to the narrow mode-badge frame, and lifted above the mode
+        # badge when shown so the clickable Tension/Compression badge can't hide it.
+        self.overload_badge = ttk.Label(top_section, textvariable=self.overload_badge_var, style="OverloadBadge.TLabel")
         self._overload_flash_visible = True
         self._overload_flash_id = None
         self.mode_badge_label = ttk.Label(mode_bar, textvariable=self.mode_badge_var, style="ModeBadgeCompression.TLabel", cursor="hand2")
@@ -1254,29 +1261,6 @@ class App(tk.Tk):
         ttk.Label(gps_box, text="Leave blank to use GPS (or 1.0 if no GPS)").grid(
             row=1, column=3, sticky="w", padx=(10, 6), pady=6)
 
-        box = ttk.LabelFrame(root, text="Detailed Connections")
-        box.pack(fill="x", **pad)
-
-        ttk.Label(box, text="HADI COM Port").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.port_combo = ttk.Combobox(box, textvariable=self.port_var, width=18)
-        self.port_combo.grid(row=0, column=1, sticky="w", pady=6)
-        ttk.Button(box, text="Refresh Ports", command=self._refresh_ports).grid(row=0, column=2, sticky="w", padx=6)
-
-        ttk.Label(box, text="Baud").grid(row=0, column=3, sticky="w", padx=(20, 4))
-        ttk.Entry(box, textvariable=self.baud_var, width=8).grid(row=0, column=4, sticky="w")
-
-        ttk.Button(box, textvariable=self.hadi_button_var, command=self._toggle_hadi).grid(row=0, column=5, padx=12)
-
-        ttk.Label(box, text="OCR UDP Port").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(box, textvariable=self.ocr_port_var, width=10).grid(row=1, column=1, sticky="w", pady=6)
-        ttk.Button(box, textvariable=self.ocr_button_var, command=self._toggle_ocr).grid(row=1, column=2, sticky="w", padx=6)
-
-        ttk.Label(box, text="HADI Update Hz").grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(box, textvariable=self.poll_var, width=8).grid(row=2, column=1, sticky="w", pady=6)
-        ttk.Button(box, text="Apply", command=self._apply_poll_rate).grid(row=2, column=2, sticky="w", padx=6)
-
-        ttk.Label(box, textvariable=self.status_var).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(12, 6))
-
         webcam_box = ttk.LabelFrame(root, text="Webcam OCR")
         webcam_box.pack(fill="x", **pad)
 
@@ -1317,6 +1301,29 @@ class App(tk.Tk):
         ttk.Label(webcam_status_frame, textvariable=self.webcam_reading_var,
                   font=("Consolas", 12, "bold")).pack(side="left")
 
+        box = ttk.LabelFrame(root, text="Detailed Connections")
+        box.pack(fill="x", **pad)
+
+        ttk.Label(box, text="HADI COM Port").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self.port_combo = ttk.Combobox(box, textvariable=self.port_var, width=18)
+        self.port_combo.grid(row=0, column=1, sticky="w", pady=6)
+        ttk.Button(box, text="Refresh Ports", command=self._refresh_ports).grid(row=0, column=2, sticky="w", padx=6)
+
+        ttk.Label(box, text="Baud").grid(row=0, column=3, sticky="w", padx=(20, 4))
+        ttk.Entry(box, textvariable=self.baud_var, width=8).grid(row=0, column=4, sticky="w")
+
+        ttk.Button(box, textvariable=self.hadi_button_var, command=self._toggle_hadi).grid(row=0, column=5, padx=12)
+
+        ttk.Label(box, text="OCR UDP Port").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(box, textvariable=self.ocr_port_var, width=10).grid(row=1, column=1, sticky="w", pady=6)
+        ttk.Button(box, textvariable=self.ocr_button_var, command=self._toggle_ocr).grid(row=1, column=2, sticky="w", padx=6)
+
+        ttk.Label(box, text="HADI Update Hz").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        ttk.Entry(box, textvariable=self.poll_var, width=8).grid(row=2, column=1, sticky="w", pady=6)
+        ttk.Button(box, text="Apply", command=self._apply_poll_rate).grid(row=2, column=2, sticky="w", padx=6)
+
+        ttk.Label(box, textvariable=self.status_var).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(12, 6))
+
         sync_box = ttk.LabelFrame(root, text="Sync Calibration")
         sync_box.pack(fill="x", **pad)
         ttk.Label(sync_box, textvariable=self.sync_status_var).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(6, 2))
@@ -1354,6 +1361,10 @@ class App(tk.Tk):
         top = ttk.LabelFrame(root, text="Saved Load Cells")
         top.pack(fill="x", **pad)
 
+        ttk.Label(
+            top, textvariable=self.in_use_cell_var, font=("Segoe UI", 10, "bold")
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 2))
+
         ttk.Label(top, text="Select").grid(row=0, column=0, sticky="w")
         self.editor_combo = ttk.Combobox(
             top,
@@ -1368,7 +1379,6 @@ class App(tk.Tk):
         ttk.Button(top, text="New", command=self._new_load_cell).grid(row=0, column=2, padx=6)
         ttk.Button(top, text="Save / Update", command=self._save_load_cell_from_editor).grid(row=0, column=3, padx=6)
         ttk.Button(top, text="Delete", command=self._delete_load_cell).grid(row=0, column=4, padx=6)
-        ttk.Button(top, text="Use Selected", command=self._use_editor_load_cell).grid(row=0, column=5, padx=6)
 
         form = ttk.LabelFrame(root, text="Load Cell Calibration Coefficients")
         form.pack(fill="both", expand=True, **pad)
@@ -2001,7 +2011,11 @@ class App(tk.Tk):
 
         if parts:
             self.overload_badge_var.set("  |  ".join(parts))
-            self.overload_badge.place(x=0, y=0)
+            # Sit to the left of the mode badge, on the same row: anchor the
+            # banner's right edge to the mode bar's left edge so it grows into
+            # the open space without covering the Tension/Compression badge.
+            self.overload_badge.place(in_=self._mode_bar, relx=0.0, rely=0.5, anchor="e", x=-10)
+            self.overload_badge.lift()
             if self._overload_flash_id is None:
                 self._overload_flash_tick()
         else:
@@ -2274,6 +2288,34 @@ class App(tk.Tk):
                 value = cell.get(side, {}).get(coeff, 0.0)
                 self.coeff_vars[f"{side}_{coeff}"].set("" if float(value or 0) == 0 else format_coeff(value))
 
+    def _on_tab_changed(self, _event=None):
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except Exception:
+            return
+        if current is self.load_cells_tab:
+            self._show_active_load_cell()
+
+    def _show_active_load_cell(self):
+        """Opening the Load Cells tab previews the cell currently in use on the
+        Capture tab (or the first saved cell when none is selected) so its
+        coefficients are visible at a glance."""
+        names = [c["name"] for c in self.load_cells]
+        if not names:
+            self.in_use_cell_var.set("No load cells saved yet — create one below.")
+            return
+        # Don't clobber a new, unsaved cell the user is in the middle of typing.
+        if not self.editor_select_var.get() and self.cell_name_var.get().strip():
+            return
+        active = self.selected_load_cell_name.get()
+        if active and active in names:
+            self.in_use_cell_var.set(f"Currently using:  {active}")
+        else:
+            active = names[0]
+            self.in_use_cell_var.set(f"Currently using:  (none selected) — showing {active}")
+        self.editor_select_var.set(active)
+        self._load_cell_into_editor()
+
     def _new_load_cell(self):
         self.editor_select_var.set("")
         self.cell_name_var.set("")
@@ -2345,16 +2387,6 @@ class App(tk.Tk):
         self.selected_load_cell_name.set(self.load_cells[0]["name"])
         self.editor_select_var.set(self.load_cells[0]["name"])
         self._sync_load_cell_controls()
-
-    def _use_editor_load_cell(self):
-        name = self.editor_select_var.get() or self.cell_name_var.get().strip()
-        cell = self._find_load_cell(name)
-        if not cell:
-            messagebox.showwarning("Not saved", "Save this load cell before using it.")
-            return
-        self.selected_load_cell_name.set(name)
-        self._select_load_cell()
-        self.notebook.select(self.capture_tab)
 
     def _prune_buffers(self, now_pc: Optional[float] = None):
         if now_pc is None:
@@ -3470,6 +3502,28 @@ class App(tk.Tk):
             self._csv_fmt_error(run_row.get("percent_error"), run_row.get("percent_error_na", False)),
         ]
 
+    # Height (data rows) of a full 20-point run block. An 11-point run reuses
+    # this height: its leading points stay at the top and its final
+    # (return-to-zero) point drops to the last row, matching a 20-point layout.
+    _CSV_REFERENCE_ROWS = 20
+
+    def _run_block_rows(self, run_key: str):
+        """Data rows for one run, padded so the last point lands on the same
+        row a 20-point save would use. Returns (rows, filled_count)."""
+        point_rows = [self._csv_row_for_point(run_key, point_row) for point_row in self.capture_rows]
+        filled = sum(1 for r in point_rows if r != ["", "", ""])
+        n = len(point_rows)
+        reference = max(self._CSV_REFERENCE_ROWS, n)
+        if n == 0 or n >= reference:
+            return point_rows, filled
+        # Leading points at the top, final point on the reference's last row,
+        # empty rows skipped in between.
+        leading = point_rows[:-1]
+        last = point_rows[-1]
+        pad = reference - n  # empty rows between the leading block and the last point
+        rows = leading + [["", "", ""] for _ in range(pad)] + [last]
+        return rows, filled
+
     def _write_capture_csv(self, path) -> int:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3479,43 +3533,25 @@ class App(tk.Tk):
         units = self.hadi_units_var.get()
         fields = self._capture_csv_fields()
 
+        blocks = []
+        if has_run1:
+            blocks.append(("Run 1", "run1"))
+        if has_run2:
+            blocks.append(("Run 2", "run2"))
+
         total_rows = 0
         with path.open("w", newline="") as f:
             writer = csv.writer(f)
 
-            if has_run1 and has_run2:
-                writer.writerow([f"Run 1 ({units})", "", "", "", f"Run 2 ({units})"])
-                writer.writerow(fields + [""] + fields)
-                rows = [
-                    (self._csv_row_for_point("run1", point_row), self._csv_row_for_point("run2", point_row))
-                    for point_row in self.capture_rows
-                ]
-                last_idx = max(
-                    (i for i, (r1, r2) in enumerate(rows) if r1 != ["", "", ""] or r2 != ["", "", ""]),
-                    default=-1,
-                )
-                for r1, r2 in rows[:last_idx + 1]:
-                    writer.writerow(r1 + [""] + r2)
-                    if r1 != ["", "", ""] or r2 != ["", "", ""]:
-                        total_rows += 1
-            elif has_run1:
-                writer.writerow([f"Run 1 ({units})"])
+            for block_idx, (label, run_key) in enumerate(blocks):
+                if block_idx > 0:
+                    writer.writerow([])  # one blank row between runs
+                writer.writerow([f"{label} ({units})"])
                 writer.writerow(fields)
-                rows = [self._csv_row_for_point("run1", point_row) for point_row in self.capture_rows]
-                last_idx = max((i for i, r1 in enumerate(rows) if r1 != ["", "", ""]), default=-1)
-                for r1 in rows[:last_idx + 1]:
-                    writer.writerow(r1)
-                    if r1 != ["", "", ""]:
-                        total_rows += 1
-            elif has_run2:
-                writer.writerow([f"Run 2 ({units})"])
-                writer.writerow(fields)
-                rows = [self._csv_row_for_point("run2", point_row) for point_row in self.capture_rows]
-                last_idx = max((i for i, r2 in enumerate(rows) if r2 != ["", "", ""]), default=-1)
-                for r2 in rows[:last_idx + 1]:
-                    writer.writerow(r2)
-                    if r2 != ["", "", ""]:
-                        total_rows += 1
+                rows, filled = self._run_block_rows(run_key)
+                for row in rows:
+                    writer.writerow(row)
+                total_rows += filled
 
         return total_rows
 
@@ -3695,6 +3731,10 @@ class App(tk.Tk):
                 ocr = self.latest_ocr.value if self.latest_ocr else None
             if hadi_lbf is None or ocr is None:
                 raise ValueError
+            # Mirror the Flip ± toggle so the live % error matches what a
+            # capture would record (capture negates OCR the same way).
+            if self.flip_sign_var.get():
+                ocr = -ocr
             hadi = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
             err, is_na = self._calculate_percent_error(ocr, hadi)
             if is_na:
