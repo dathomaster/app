@@ -43,33 +43,15 @@ class ROI:
 
 
 class WebcamOCR:
-    """Webcam-based OCR that mimics the OCRReceiver interface."""
+    """Webcam-based OCR that mimics the OCRReceiver interface.
 
-    # Suspicious integer-jump readings must repeat (within tolerance) this many
-    # times before being accepted as a real value change rather than a glitch.
-    JUMP_CONFIRM_FRAMES = 2
-    # ...but never withhold a reading longer than this, so a persistent (even if
-    # not exactly repeating) jump can't get stuck rejecting forever.
-    JUMP_MAX_HOLD_SECONDS = 0.4
+    Every number read is passed on as-is; a missed decimal point is restored
+    by the app (Settings -> Decimal point), not filtered out here.
+    """
 
-    def __init__(self, cam_index: int = 0,
-                 value_range: Optional[tuple] = None,
-                 reject_integer_jumps: bool = True):
-        """
-        :param value_range: optional (min, max) tuple. Readings outside this range
-            are silently dropped.
-        :param reject_integer_jumps: if True, a reading with no fractional part that
-            differs from the previous accepted reading by more than 10x is treated
-            as a likely missing-decimal-point misread (e.g. ".034" recognized as
-            "34") and held rather than accepted immediately. It's only dropped if
-            it fails to repeat within JUMP_CONFIRM_FRAMES frames/JUMP_MAX_HOLD_SECONDS
-            — a genuine fast load change still gets through quickly, while a
-            one-off OCR glitch (which rarely repeats identically) gets filtered.
-        """
+    def __init__(self, cam_index: int = 0):
         self.cam_index = cam_index
         self.roi = ROI()
-        self.value_range = value_range
-        self.reject_integer_jumps = reject_integer_jumps
         self._cap: Optional[cv2.VideoCapture] = None
         self._thread: Optional[threading.Thread] = None
         self._capture_thread: Optional[threading.Thread] = None
@@ -92,48 +74,26 @@ class WebcamOCR:
         self.last_frame: Optional[np.ndarray] = None
         self.last_crop: Optional[np.ndarray] = None
         self._ocr_engine = None
-        self.rejected_count = 0
-        self._pending_value: Optional[float] = None
-        self._pending_count: int = 0
-        self._pending_since: float = 0.0
-        # Camera latency estimation: measures the full pipeline delay
-        # (camera internal buffer + USB transfer + grab call blocking time).
-        # This is subtracted from the timestamp so the OCR reading aligns
-        # with when the display actually showed that number.
+        # Starting guess for how long after the display shows a number its
+        # frame arrives here (Settings -> Cam Latency). The app's sync
+        # estimator measures the real value from live data and takes over.
         self.camera_latency_ms: float = 190.0
 
     def _init_engine(self):
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
-        ocr.use_text_det = False
-        ocr.use_angle_cls = False
-        self._ocr_engine = ocr
+        # PP-OCRv6 tiny recognition (rapidocr>=3.10).
+        from rapidocr import RapidOCR, OCRVersion, ModelType
+        self._ocr_engine = RapidOCR(params={
+            "Rec.ocr_version": OCRVersion.PPOCRV6,
+            "Rec.model_type": ModelType.TINY,
+            "Rec.lang_type": "en",
+        })
+        # The model loads lazily on the first inference (~200 ms); pay it here
+        # so the first live reading isn't late.
+        self._run_ocr(np.zeros((48, 160, 3), np.uint8))
 
     def _run_ocr(self, img: np.ndarray) -> str:
-        result, _ = self._ocr_engine(img)
-        if not result:
-            return ""
-        texts = [text for _, text, _ in result]
-        return " ".join(texts)
-
-    @staticmethod
-    def _fix_dropped_decimal(raw: str) -> str:
-        """Reconstruct a number whose decimal point was dropped by OCR.
-
-        No real display renders an integer with a redundant leading zero
-        (e.g. "0345") — the only way that text comes out of OCR is if the
-        original was "0.345" and the dot was lost. Detecting this from the
-        digit pattern itself is unambiguous, unlike guessing from history.
-        "0.12" is untouched since it already has its dot.
-        """
-        sign = ""
-        digits = raw
-        if digits and digits[0] in "+-":
-            sign = "-" if digits[0] == "-" else ""
-            digits = digits[1:]
-        if "." not in raw and len(digits) > 1 and digits[0] == "0":
-            return f"{sign}0.{digits[1:]}"
-        return raw
+        result = self._ocr_engine(img, use_det=False, use_cls=False, use_rec=True)
+        return " ".join(result.txts or ())
 
     @staticmethod
     def preprocess(crop: np.ndarray) -> np.ndarray:
@@ -287,42 +247,10 @@ class WebcamOCR:
             numbers = NUM_RE.findall(text)
             if numbers:
                 try:
-                    raw_num = self._fix_dropped_decimal(numbers[0])
+                    # Passed on exactly as read; a dropped decimal point is
+                    # restored by the app (Settings -> Decimal point).
+                    raw_num = numbers[0]
                     val = float(raw_num)
-
-                    if self.value_range is not None:
-                        lo, hi = self.value_range
-                        if val < lo or val > hi:
-                            self.rejected_count += 1
-                            continue
-
-                    suspicious = False
-                    if self.reject_integer_jumps and val == int(val):
-                        prev = self._latest.value if self._latest else None
-                        if prev is not None and prev != 0 and abs(val) > abs(prev) * 10:
-                            suspicious = True
-
-                    if suspicious:
-                        now = time.perf_counter()
-                        tol = max(0.5, abs(self._pending_value or 0) * 0.01)
-                        if self._pending_value is not None and abs(val - self._pending_value) <= tol:
-                            self._pending_count += 1
-                        else:
-                            self._pending_value = val
-                            self._pending_count = 1
-                            self._pending_since = now
-
-                        confirmed = (self._pending_count >= self.JUMP_CONFIRM_FRAMES or
-                                     (now - self._pending_since) >= self.JUMP_MAX_HOLD_SECONDS)
-                        if not confirmed:
-                            self.rejected_count += 1
-                            continue
-                        self._pending_value = None
-                        self._pending_count = 0
-                    else:
-                        self._pending_value = None
-                        self._pending_count = 0
-
                     reading = Reading(
                         value=val,
                         timestamp=capture_wall,

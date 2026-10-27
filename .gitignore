@@ -4,6 +4,8 @@ autosaves/
 # Runtime state written by the app
 sync_state.json
 camera_prefs.json
+freeze_log*.txt
+decimal_point.json
 
 # Python cache
 __pycache__/
@@ -14,3 +16,4 @@ __pycache__/
 build/
 dist/
 *.spec
+!packaging/*.spec

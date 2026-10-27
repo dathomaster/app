@@ -13,7 +13,6 @@ Keep ocr_stream.py in the same folder.
 
 from __future__ import annotations
 
-import bisect
 import csv
 import json
 import math
@@ -23,13 +22,14 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import deque
-import statistics
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -54,6 +54,9 @@ try:
 except ImportError:
     _HAS_WEBCAM_DEPS = False
 
+# The one place the version lives: window title, build name and installer
+# (packaging/build.ps1 reads it from here).
+APP_VERSION = "1.6"
 
 if getattr(sys, "frozen", False):
     # Running as a PyInstaller-frozen exe: __file__ resolves to the
@@ -70,6 +73,8 @@ LOAD_CELLS_FILE = APP_DIR / "load_cells.json"
 SYNC_STATE_FILE = APP_DIR / "sync_state.json"
 CAMERA_PREFS_FILE = APP_DIR / "camera_prefs.json"
 AUTOSAVE_DIR = APP_DIR / "autosaves"
+FREEZE_LOG_FILE = APP_DIR / "freeze_log.txt"
+DECIMAL_POINT_FILE = APP_DIR / "decimal_point.json"
 
 # Fallback default webcam (used only until a camera has actually been
 # selected/connected at least once) — matched by DirectShow device name
@@ -89,10 +94,15 @@ def load_camera_prefs() -> dict:
 
 
 def save_camera_prefs(camera_name: str) -> None:
-    CAMERA_PREFS_FILE.write_text(
-        json.dumps({"camera_name": camera_name}, indent=2),
-        encoding="utf-8",
-    )
+    try:
+        CAMERA_PREFS_FILE.write_text(
+            json.dumps({"camera_name": camera_name}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 
 # Starting calibration from the current Morehouse certificate.
 # Force (lbf) = B0 + B1*R + B2*R^2 + B3*R^3, where R is response in mV/V.
@@ -147,7 +157,12 @@ def load_saved_load_cells() -> list[dict]:
 
 
 def save_load_cells(load_cells: list[dict]) -> None:
-    LOAD_CELLS_FILE.write_text(json.dumps(load_cells, indent=2), encoding="utf-8")
+    # Guarded like every settings write: if the app's folder isn't writable
+    # (e.g. installed under Program Files) the app must still start.
+    try:
+        LOAD_CELLS_FILE.write_text(json.dumps(load_cells, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 
@@ -246,7 +261,8 @@ HADI_UNIT_FACTORS = {
     "t": 0.00045359237,
 }
 
-HADI_DECIMAL_OPTIONS = ["1", "0.1", "0.01", "0.001", "0.0001", "0.00001"]
+# "Auto" = one more decimal than the OCR reading (see _selected_hadi_decimals).
+HADI_DECIMAL_OPTIONS = ["1", "0.1", "0.01", "0.001", "0.0001", "0.00001", "Auto"]
 
 
 def _decimals_from_step(step_text: str) -> int:
@@ -290,6 +306,7 @@ class HADIWorker:
     def __init__(self):
         self.ser = None
         self.thread = None
+        self._close_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.out: "queue.Queue[HADIReading | Exception]" = queue.Queue(maxsize=100)
         self.mode = "Compression"
@@ -306,8 +323,10 @@ class HADIWorker:
         if serial is None:
             raise RuntimeError("pyserial is not installed. Run: pip install pyserial")
         self.disconnect()
-        self.stop_event.clear()
-        self.ser = serial.Serial(
+        # Normally already finished; only waits if Connect follows a
+        # Disconnect within the second or so the old port takes to close.
+        self.wait_closed(2.0)
+        ser = serial.Serial(
             port=port,
             baudrate=baudrate,
             bytesize=serial.EIGHTBITS,
@@ -316,20 +335,54 @@ class HADIWorker:
             timeout=0.2,
             write_timeout=0.2,
         )
-        self.thread = threading.Thread(target=self._loop, daemon=True, name="HADIWorker")
+        # Each connection gets its own stop event and port handle, so a
+        # worker still winding down from a previous connection can never be
+        # revived by (or write to) the next one.
+        stop_event = threading.Event()
+        self.ser = ser
+        self.stop_event = stop_event
+        self.thread = threading.Thread(target=self._loop, args=(ser, stop_event),
+                                       daemon=True, name="HADIWorker")
         self.thread.start()
 
-    def disconnect(self):
+    def disconnect(self, wait: bool = True):
+        """Stop the worker and close the port.
+
+        With wait=False the join and close happen on a background thread:
+        both can block for a second or more (worker mid-read, or a USB-serial
+        adapter that has dropped out), and doing that on the Tk thread is
+        what froze the whole window whenever the HADI hiccupped.
+        """
+        ser, thread = self.ser, self.thread
         self.stop_event.set()
-        if self.thread:
-            self.thread.join(timeout=1.0)
-        self.thread = None
-        if self.ser:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
         self.ser = None
+        self.thread = None
+
+        def finish():
+            if thread:
+                thread.join(timeout=1.0)
+            if ser:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+
+        if wait:
+            finish()
+        else:
+            self._close_thread = threading.Thread(target=finish, daemon=True, name="HADIClose")
+            self._close_thread.start()
+
+    def wait_closed(self, timeout: float) -> None:
+        """Wait for a background close from disconnect(wait=False) to finish.
+
+        Windows won't reopen a COM port while the old handle is still open,
+        so anything about to open a port (connect, the auto-scan probe) must
+        let the previous close complete first.
+        """
+        t = self._close_thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout)
 
     @staticmethod
     def probe_port(port: str, baudrate: int = 19200, command: str = "GN",
@@ -356,17 +409,28 @@ class HADIWorker:
             return
         self.ser.write((self.tare_command + self.line_ending).encode("ascii", errors="ignore"))
 
-    def _loop(self):
-        while not self.stop_event.is_set():
+    # A write timeout is usually the USB-serial adapter stalling briefly, not
+    # the HADI going away. Retry this many times in a row before reporting it,
+    # since reporting triggers a full disconnect + port rescan (seconds dead).
+    MAX_WRITE_TIMEOUT_RETRIES = 3
+
+    def _loop(self, ser, stop_event: threading.Event):
+        write_timeouts = 0
+        # Polls run on a fixed schedule: sleeping a full period *after* each
+        # ~35 ms command/reply made "10 Hz" really ~7.3 Hz.
+        next_poll = time.perf_counter()
+        while not stop_event.is_set():
+            next_poll += 1.0 / max(1.0, self.poll_hz)
             try:
-                if not self.is_connected():
+                if not ser.is_open:
                     time.sleep(0.2)
                     continue
-                self.ser.reset_input_buffer()
-                self.ser.write((self.read_command + self.line_ending).encode("ascii", errors="ignore"))
-                raw = self.ser.read_until(b"\r", size=256)
+                ser.reset_input_buffer()
+                ser.write((self.read_command + self.line_ending).encode("ascii", errors="ignore"))
+                raw = ser.read_until(b"\r", size=256)
                 if not raw:
-                    raw = self.ser.read_until(b"\n", size=256)
+                    raw = ser.read_until(b"\n", size=256)
+                write_timeouts = 0
                 text = raw.decode("ascii", errors="ignore").strip()
                 value = parse_hadi_response(text)
                 if value is not None:
@@ -382,47 +446,171 @@ class HADIWorker:
                         except Exception:
                             pass
             except Exception as exc:
+                if stop_event.is_set():
+                    break  # port was closed under us by disconnect()
+                if (isinstance(exc, serial.SerialTimeoutException)
+                        and write_timeouts < self.MAX_WRITE_TIMEOUT_RETRIES):
+                    write_timeouts += 1
+                    log_freeze(f"HADI write timeout, retrying ({write_timeouts}/"
+                               f"{self.MAX_WRITE_TIMEOUT_RETRIES})")
+                    try:
+                        ser.reset_output_buffer()
+                    except Exception:
+                        pass
+                    stop_event.wait(0.05)
+                    continue
                 try:
                     self.out.put_nowait(exc)
                 except queue.Full:
                     pass
-                time.sleep(0.5)
-            time.sleep(max(0.02, 1.0 / max(1.0, self.poll_hz)))
+                stop_event.wait(0.5)
+            delay = next_poll - time.perf_counter()
+            if delay < 0:
+                # Fell behind (slow reply, error back-off): restart the
+                # schedule from now rather than firing a burst to catch up.
+                next_poll = time.perf_counter()
+                delay = 0.0
+            stop_event.wait(max(0.01, delay))
 
 
 def load_sync_state() -> dict:
     if not SYNC_STATE_FILE.exists():
-        return {"lag_ms": 239.0, "confidence": 0.0, "manual": False, "calibration_lag_ms": 239.0}
+        return {"lag_ms": 239.0, "confidence": 0.0, "manual": False}
     try:
         data = json.loads(SYNC_STATE_FILE.read_text(encoding="utf-8"))
         return {
             "lag_ms": float(data.get("lag_ms", 239.0)),
             "confidence": float(data.get("confidence", 0.0)),
             "manual": bool(data.get("manual", False)),
-            "calibration_lag_ms": float(data.get("calibration_lag_ms", 239.0)),
         }
     except Exception:
-        return {"lag_ms": 239.0, "confidence": 0.0, "manual": False, "calibration_lag_ms": 239.0}
+        return {"lag_ms": 239.0, "confidence": 0.0, "manual": False}
 
 
-def save_sync_state(lag_ms: float, confidence: float, manual: bool = False,
-                    calibration_lag_ms: float = 0.0) -> None:
-    SYNC_STATE_FILE.write_text(
-        json.dumps({
-            "lag_ms": lag_ms, "confidence": confidence,
-            "manual": manual, "calibration_lag_ms": calibration_lag_ms,
-        }, indent=2),
-        encoding="utf-8",
-    )
+def log_freeze(message: str) -> None:
+    """Append a timestamped entry to freeze_log.txt (rotated at 1 MB)."""
+    try:
+        if FREEZE_LOG_FILE.exists() and FREEZE_LOG_FILE.stat().st_size > 1_000_000:
+            FREEZE_LOG_FILE.replace(FREEZE_LOG_FILE.with_suffix(".old.txt"))
+        with FREEZE_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S.%f}] {message}\n")
+    except Exception:
+        pass
+
+
+DECIMAL_POINT_OPTIONS = ["Off", "Auto", "0", "1", "2", "3", "4", "5"]
+
+
+def load_decimal_point_mode() -> str:
+    try:
+        mode = json.loads(DECIMAL_POINT_FILE.read_text(encoding="utf-8")).get("mode")
+        return mode if mode in DECIMAL_POINT_OPTIONS else "Auto"
+    except Exception:
+        return "Auto"
+
+
+def save_decimal_point_mode(mode: str) -> None:
+    try:
+        DECIMAL_POINT_FILE.write_text(json.dumps({"mode": mode}, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+class DecimalPointFixer:
+    """Restore a decimal point the OCR missed (e.g. 987.65 read as 98765).
+
+    Only touches an all-digit number with no '.'; anything where the dot was
+    read is returned unchanged. Modes:
+      Off   - return the number exactly as read.
+      0..5  - put the dot that many digits from the right ("98765" with 2 is
+              "987.65", "000" with 2 is "0.00", "12776" with 5 is "0.12776"
+              for displays that omit the leading zero; fewer digits than
+              decimals is a partial read and is left alone).
+      Auto  - pick the dot position whose value is closest to the HADI force
+              (within 3x); otherwise use the decimals last actually read;
+              otherwise show the raw digits.
+    Called from the OCR thread; `mode` is a plain str set from the Tk thread.
+    """
+
+    # Dot positions are 10x apart, so halfway between them on a log scale
+    # (sqrt(10) ~ 3.16) is the furthest a match can be and still be decisive.
+    MATCH_MAX_RATIO = 3.0
+
+    def __init__(self, mode: str = "Auto"):
+        self.mode = mode
+        self.remembered_decimals: Optional[int] = None
+
+    @staticmethod
+    def _insert(sign: str, digits: str, decimals: int) -> str:
+        # The dot may go before every digit: displays that drop the leading
+        # zero show ".12776", so a missed dot leaves "12776" = 0.12776.
+        # Fewer digits than decimals means part of the number was missed;
+        # leave that alone rather than invent zeros.
+        if decimals <= 0 or len(digits) < decimals:
+            return sign + digits
+        whole = digits[:-decimals].lstrip("0") or "0"  # "001" -> "0.1", not "00.1"
+        return f"{sign}{whole}.{digits[-decimals:]}"
+
+    def fix(self, text: str, hadi_force: Optional[float] = None) -> str:
+        """`hadi_force` is the HADI force in display units, or None when it
+        shouldn't be used (no/stale HADI, no cell, or near zero load)."""
+        text = text.strip()
+        sign = text[0] if text.startswith(("+", "-")) else ""
+        digits = text[len(sign):]
+        if "." in digits:
+            # "987." is a partial read (a display with no decimals shows no
+            # dot), so it mustn't teach us the display has 0 decimals.
+            decimals = len(digits.split(".", 1)[1])
+            if decimals:
+                self.remembered_decimals = decimals
+            return text
+        if self.mode == "Off" or not digits.isdigit():
+            return text
+        if self.mode != "Auto":
+            return self._insert(sign, digits, int(self.mode))
+
+        number = int(digits)
+        target = abs(hadi_force) if hadi_force else 0.0
+        if number and target:
+            best = None
+            for decimals in range(len(digits) + 1):
+                value = number / 10 ** decimals
+                ratio = max(value, target) / min(value, target)
+                if ratio <= self.MATCH_MAX_RATIO and (best is None or ratio < best[0]):
+                    best = (ratio, decimals)
+            if best is not None:
+                return self._insert(sign, digits, best[1])
+        if self.remembered_decimals is not None:
+            return self._insert(sign, digits, self.remembered_decimals)
+        # Nothing known yet. A leading zero ("0345") still pins it down: no
+        # display shows an integer with a redundant leading 0, so it was 0.345.
+        if len(digits) > 1 and digits[0] == "0":
+            return f"{sign}0.{digits[1:]}"
+        return text
+
+
+def save_sync_state(lag_ms: float, confidence: float, manual: bool = False) -> None:
+    try:
+        SYNC_STATE_FILE.write_text(
+            json.dumps({"lag_ms": lag_ms, "confidence": confidence, "manual": manual}, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("HADI + OCR Capture")
-        self.geometry("1115x720")
-        self.minsize(980, 650)
+        self.title(f"HADI + OCR Capture v{APP_VERSION}")
+        # Fit the screen it opens on: shrink if needed and place it high enough
+        # that the taskbar doesn't cover the bottom (Settings scrolls if short).
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(1115, sw - 40)
+        h = min(720, sh - 110)          # room for the title bar and taskbar
+        self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 40)}")
+        self.minsize(min(980, w), min(650, h))
 
         self.load_cells = load_saved_load_cells()
         self.selected_load_cell_name = tk.StringVar(value="")
@@ -446,6 +634,7 @@ class App(tk.Tk):
         self.ocr_edit_item = None
         self.ocr_edit_row_index = None
         self.ocr_edit_tree = None
+        self.edit_original_text = ""
         self.suppress_next_tree_select = False
         self.suppress_next_tree_click = False
 
@@ -453,20 +642,16 @@ class App(tk.Tk):
         # continuously estimate a fixed OCR-vs-HADI lag from recent waveform shape,
         # save it, then capture by corrected time. This never matches by closest value.
         sync_state = load_sync_state()
-        self.calibration_lag_seconds = sync_state["calibration_lag_ms"] / 1000.0
-        if self.calibration_lag_seconds > 0 and sync_state["confidence"] < 0.5:
-            self.sync_lag_seconds = self.calibration_lag_seconds
-        else:
-            self.sync_lag_seconds = sync_state["lag_ms"] / 1000.0
+        self.sync_lag_seconds = sync_state["lag_ms"] / 1000.0
         self.sync_confidence = sync_state["confidence"]
         self.sync_manual = False
         self.sync_window_seconds = 8.0
-        self.capture_median_half_window = 0.100   # 200 ms total around aligned target
         self.buffer_keep_seconds = 15.0
         self.hadi_buffer = deque()
         self.ocr_buffer = deque()
         self.ocr_lock = threading.Lock()
         self._last_sync_update = 0.0
+        self._reset_lag_tracking()
 
         self.serial_number_var = tk.StringVar(value="")
         self.customer_capacity_var = tk.StringVar(value="")
@@ -487,21 +672,44 @@ class App(tk.Tk):
 
         self.latest_gps: Optional[GPSFix] = None
         self._mf_override: Optional[float] = None
+        self._manual_location: Optional[dict] = None
+        # What was last applied, so Cancel in the "Gravity changed" prompt
+        # can put the entry boxes back.
+        self._location_applied_text = ("", "", "ft")
+        self._mf_override_applied_text = ""
         self.gps_status_var = tk.StringVar(value="Gravity: waiting for GPS")
         self.mf_override_var = tk.StringVar(value="")
+        self.loc_lat_var = tk.StringVar(value="")
+        self.loc_elev_var = tk.StringVar(value="")
+        self.loc_elev_unit_var = tk.StringVar(value="ft")
         self.manual_weight_var = tk.StringVar(value="")
 
         self.port_var = tk.StringVar()
         self.baud_var = tk.StringVar(value="19200")
         self.mode_var = tk.StringVar(value="Tension")
         self.hadi_units_var = tk.StringVar(value="LBF")
+        self._applied_hadi_units = "LBF"
         self.hadi_decimals_var = tk.StringVar(value="0.00001")
+        self.zero_b0_var = tk.BooleanVar(value=False)   # "Better Zero" (temporary, not saved)
+        self.decimal_point_var = tk.StringVar(value=load_decimal_point_mode())
+        self.decimal_fixer = DecimalPointFixer(self.decimal_point_var.get())
+        self.decimal_point_var.trace_add("write", lambda *_: self._on_decimal_point_change())
+        # (HADI force in display units, pc_time), refreshed by the Tk thread
+        # each UI tick for the OCR thread's Auto decimal placement — the OCR
+        # thread must not touch Tk variables itself.
+        self._dp_hadi: Optional[tuple] = None
+        # Decimals in the latest OCR reading, for Dec = Auto (OCR thread writes).
+        self._last_ocr_decimals: Optional[int] = None
         self.hadi_title_var = tk.StringVar(value="HADI Force (LBF)")
         self.mode_badge_var = tk.StringVar(value="COMPRESSION")
         self._hadi_overload = False
         self._hadi_overload_text = ""
-        self._ocr_overload = False
-        self._ocr_overload_text = ""
+        self._device_overload = False
+        self._capacity_state: Optional[dict] = None   # see _capacity_in_units
+        # Units before the first units change, and the Capacity as typed:
+        # what "Restore original" goes back to (see _on_hadi_units_selected).
+        self._units_original: Optional[str] = None
+        self._capacity_captured: Optional[dict] = None
         self.poll_var = tk.StringVar(value="10")
         self.ocr_port_var = tk.StringVar(value="9999")
         self.status_var = tk.StringVar(value="Disconnected")
@@ -522,9 +730,6 @@ class App(tk.Tk):
         self.target_var = tk.StringVar(value="Next: P1 R1")
         self.sync_status_var = tk.StringVar(value="Sync: starting...")
         self.sync_lag_ms_var = tk.StringVar(value=f"{self.sync_lag_seconds * 1000.0:.0f}")
-        self.cal_lag_ms_var = tk.StringVar(
-            value=f"{self.calibration_lag_seconds * 1000.0:.0f}" if self.calibration_lag_seconds > 0 else ""
-        )
 
         self.dirty_data = False
         self.last_manual_save_path = None
@@ -563,6 +768,11 @@ class App(tk.Tk):
         self._refresh_hadi_mode_badge()
         self._refresh_ports()
         self._sync_load_cell_controls()
+        self._refresh_gravity_status()   # show the starting MF on the W button
+        self._ui_heartbeat = time.perf_counter()
+        self._last_tick_error: Optional[str] = None
+        self._hadi_went_stale: Optional[float] = None
+        self._start_freeze_watchdog()
         self.after(50, self._ui_tick)
         self.after(700, lambda: self._refresh_camera_list(then=self._auto_connect_on_launch))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -602,7 +812,9 @@ class App(tk.Tk):
         self.notebook.add(self.connection_tab, text="Settings")
 
         self._build_capture_tab(self.capture_tab)
-        self._build_connection_tab(self.connection_tab)
+        # Settings is taller than the default window, so it scrolls rather
+        # than cutting off the bottom sections on smaller screens.
+        self._build_connection_tab(self._scrollable(self.connection_tab))
         self._build_load_cells_tab(self.load_cells_tab)
         self._build_converter_tab(self.converter_tab)
         self._build_report_tab(self.report_tab)
@@ -640,7 +852,7 @@ class App(tk.Tk):
         ttk.Label(controls, text="Units").grid(row=0, column=2, sticky="w", padx=(8, 2), pady=4)
         units = ttk.Combobox(controls, textvariable=self.hadi_units_var, values=["LBF", "KGF", "N", "kN", "gF", "t", "mV/V"], state="readonly", width=6, font=("Segoe UI", 10))
         units.grid(row=0, column=3, sticky="w", padx=(0, 8), pady=4)
-        units.bind("<<ComboboxSelected>>", lambda _e: self._set_hadi_display_options())
+        units.bind("<<ComboboxSelected>>", lambda _e: self._on_hadi_units_selected())
 
         ttk.Label(controls, text="Dec").grid(row=0, column=4, sticky="w", pady=4)
         decimals = ttk.Combobox(controls, textvariable=self.hadi_decimals_var, values=HADI_DECIMAL_OPTIONS, state="readonly", width=7, font=("Segoe UI", 10))
@@ -703,8 +915,8 @@ class App(tk.Tk):
         self._cam_popup_canvas = None
         self._cam_popup_photo = None
         self._cam_popup_img_id = None
-        self._cam_popup_drawing = False
-        self._cam_popup_box_start = None
+        self._cam_popup_geom = None
+        self._cam_popup_drag = None
         self._start_capture_cam_preview()
 
         self._ac_gauge = tk.Canvas(root, height=24, highlightthickness=0, bg="#e5e7eb")
@@ -771,6 +983,7 @@ class App(tk.Tk):
         ttk.Label(btns, textvariable=self.capacity_label_var).pack(side="left", padx=(8, 2))
         cap_entry = ttk.Entry(btns, textvariable=self.customer_capacity_var, width=7)
         cap_entry.pack(side="left")
+        self._capacity_entry = cap_entry   # units-change note pops up above it
         cap_entry.bind("<Return>", lambda _e: self._apply_customer_capacity())
         cap_entry.bind("<FocusOut>", lambda _e: self._apply_customer_capacity())
 
@@ -838,26 +1051,47 @@ class App(tk.Tk):
 
         self._initialize_point_rows(11)
 
+    _ROI_MIN = 10
+    _ROI_HANDLE_PX = 8
+    _ROI_CURSORS = {
+        "": "crosshair", "move": "fleur",
+        "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+        "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
+        "nw": "size_nw_se", "se": "size_nw_se", "ne": "size_ne_sw", "sw": "size_ne_sw",
+    }
+
     def _open_cam_popup(self):
         if self._cam_popup and self._cam_popup.winfo_exists():
             self._cam_popup.lift()
             return
 
         self._cam_popup = tk.Toplevel(self)
-        self._cam_popup.title("Camera — drag to set bounding box, right-click to reset")
-        self._cam_popup.geometry("640x480")
+        self._cam_popup.title(
+            "Camera — drag box to move · drag edges/corners to resize · drag outside to draw new · "
+            "arrows nudge (Shift = 10) · right-click reset")
+        self._cam_popup.geometry("800x560")
         self._cam_popup.attributes("-topmost", True)
         self._cam_popup.protocol("WM_DELETE_WINDOW", self._close_cam_popup)
 
-        self._cam_popup_canvas = tk.Canvas(self._cam_popup, bg="#1a1a1a", cursor="crosshair")
-        self._cam_popup_canvas.pack(fill="both", expand=True)
-        self._cam_popup_canvas.bind("<ButtonPress-1>", self._cam_popup_mouse_down)
-        self._cam_popup_canvas.bind("<B1-Motion>", self._cam_popup_mouse_drag)
-        self._cam_popup_canvas.bind("<ButtonRelease-1>", self._cam_popup_mouse_up)
-        self._cam_popup_canvas.bind("<ButtonPress-3>", self._webcam_reset_roi)
+        c = tk.Canvas(self._cam_popup, bg="#1a1a1a", cursor="crosshair", highlightthickness=0)
+        c.pack(fill="both", expand=True)
+        self._cam_popup_canvas = c
+        c.bind("<ButtonPress-1>", self._cam_popup_mouse_down)
+        c.bind("<B1-Motion>", self._cam_popup_mouse_drag)
+        c.bind("<ButtonRelease-1>", self._cam_popup_mouse_up)
+        c.bind("<Motion>", self._cam_popup_hover)
+        c.bind("<ButtonPress-3>", self._webcam_reset_roi)
+        for key, dx, dy in (("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)):
+            self._cam_popup.bind(f"<{key}>", lambda _e, dx=dx, dy=dy: self._cam_popup_nudge(dx, dy))
+            self._cam_popup.bind(f"<Shift-{key}>", lambda _e, dx=dx, dy=dy: self._cam_popup_nudge(dx * 10, dy * 10))
 
         self._cam_popup_photo = None
         self._cam_popup_img_id = None
+        self._cam_popup_geom = None
+        self._cam_popup_drag = None
+        self._cam_popup_box_ids = None
+        self._cam_popup_msg_id = None
+        self._cam_popup.focus_force()
         self._cam_popup_tick()
 
     def _close_cam_popup(self):
@@ -865,6 +1099,8 @@ class App(tk.Tk):
             self._cam_popup.destroy()
             self._cam_popup = None
             self._cam_popup_canvas = None
+            self._cam_popup_drag = None
+            self._cam_popup_geom = None
 
     def _cam_popup_tick(self):
         if not self._cam_popup or not self._cam_popup.winfo_exists():
@@ -877,76 +1113,184 @@ class App(tk.Tk):
             self._cam_popup.after(100, self._cam_popup_tick)
 
     def _cam_popup_tick_body(self):
+        c = self._cam_popup_canvas
         frame = None
         if self.webcam_ocr and self.webcam_ocr.last_frame is not None:
             frame = self.webcam_ocr.last_frame
 
-        if frame is not None and _HAS_WEBCAM_DEPS:
-            cw = self._cam_popup_canvas.winfo_width()
-            ch = self._cam_popup_canvas.winfo_height()
-            if cw > 1 and ch > 1:
-                fh, fw = frame.shape[:2]
-                scale = min(cw / fw, ch / fh)
-                new_w = int(fw * scale)
-                new_h = int(fh * scale)
-                resized = _cv2.resize(frame, (new_w, new_h))
-                rgb = _cv2.cvtColor(resized, _cv2.COLOR_BGR2RGB)
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if frame is None or not _HAS_WEBCAM_DEPS or cw <= 1 or ch <= 1:
+            if self._cam_popup_msg_id is None and cw > 1:
+                self._cam_popup_msg_id = c.create_text(
+                    cw // 2, ch // 2, fill="#bbbbbb", font=("Segoe UI", 11),
+                    text="No camera image — start Webcam OCR")
+            return
+        if self._cam_popup_msg_id is not None:
+            c.delete(self._cam_popup_msg_id)
+            self._cam_popup_msg_id = None
 
-                x1, y1, x2, y2 = self._webcam_roi
-                rx1, ry1 = int(x1 * scale), int(y1 * scale)
-                rx2, ry2 = int(x2 * scale), int(y2 * scale)
-                _cv2.rectangle(rgb, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
+        fh, fw = frame.shape[:2]
+        scale = min(cw / fw, ch / fh)
+        new_w, new_h = max(1, int(fw * scale)), max(1, int(fh * scale))
+        off_x, off_y = (cw - new_w) // 2, (ch - new_h) // 2
+        self._cam_popup_geom = (scale, off_x, off_y, fw, fh)
 
-                img = Image.fromarray(rgb)
-                self._cam_popup_photo = ImageTk.PhotoImage(img)
-                if self._cam_popup_img_id:
-                    self._cam_popup_canvas.itemconfig(
-                        self._cam_popup_img_id, image=self._cam_popup_photo)
-                else:
-                    self._cam_popup_img_id = self._cam_popup_canvas.create_image(
-                        cw // 2, ch // 2, image=self._cam_popup_photo)
+        if self._cam_popup_drag is None:
+            # Keep the box inside this camera's frame so it can never end up
+            # off-image (e.g. after switching to a lower-resolution camera).
+            clamped = self._clamp_roi(self._webcam_roi, fw, fh)
+            if clamped != tuple(self._webcam_roi):
+                self._set_webcam_roi(clamped)
+
+        rgb = _cv2.cvtColor(_cv2.resize(frame, (new_w, new_h)), _cv2.COLOR_BGR2RGB)
+        self._cam_popup_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        if self._cam_popup_img_id:
+            c.itemconfig(self._cam_popup_img_id, image=self._cam_popup_photo)
+            c.coords(self._cam_popup_img_id, off_x, off_y)
+        else:
+            self._cam_popup_img_id = c.create_image(off_x, off_y, anchor="nw", image=self._cam_popup_photo)
+        self._cam_popup_draw_box()
+
+    def _clamp_roi(self, roi, fw, fh):
+        m = self._ROI_MIN
+        x1, y1, x2, y2 = (int(v) for v in roi)
+        w = max(m, min(x2 - x1, fw))
+        h = max(m, min(y2 - y1, fh))
+        x1 = max(0, min(x1, fw - w))
+        y1 = max(0, min(y1, fh - h))
+        return (x1, y1, x1 + w, y1 + h)
+
+    def _set_webcam_roi(self, roi, apply_to_ocr=True):
+        self._webcam_roi = tuple(int(v) for v in roi)
+        if apply_to_ocr and self.webcam_ocr:
+            # Swap in a whole new ROI so the OCR thread never reads a box
+            # with some edges updated and others not.
+            self.webcam_ocr.roi = type(self.webcam_ocr.roi)(*self._webcam_roi)
+
+    def _roi_to_canvas(self, roi):
+        scale, off_x, off_y, _fw, _fh = self._cam_popup_geom
+        x1, y1, x2, y2 = roi
+        return (off_x + x1 * scale, off_y + y1 * scale, off_x + x2 * scale, off_y + y2 * scale)
 
     def _cam_popup_to_frame(self, cx, cy):
-        if not self.webcam_ocr or self.webcam_ocr.last_frame is None:
-            return cx, cy
-        frame = self.webcam_ocr.last_frame
-        fh, fw = frame.shape[:2]
-        cw = self._cam_popup_canvas.winfo_width()
-        ch = self._cam_popup_canvas.winfo_height()
-        if cw <= 1 or ch <= 1:
-            return cx, cy
-        scale = min(cw / fw, ch / fh)
-        new_w = int(fw * scale)
-        new_h = int(fh * scale)
-        offset_x = (cw - new_w) // 2
-        offset_y = (ch - new_h) // 2
-        fx = int((cx - offset_x) / scale)
-        fy = int((cy - offset_y) / scale)
+        scale, off_x, off_y, fw, fh = self._cam_popup_geom
+        fx = int(round((cx - off_x) / scale))
+        fy = int(round((cy - off_y) / scale))
         return max(0, min(fx, fw)), max(0, min(fy, fh))
 
+    def _cam_popup_draw_box(self):
+        c = self._cam_popup_canvas
+        if c is None or self._cam_popup_geom is None:
+            return
+        x1, y1, x2, y2 = self._roi_to_canvas(self._webcam_roi)
+        if self._cam_popup_box_ids is None:
+            rect = c.create_rectangle(0, 0, 0, 0, outline="#00ff00", width=2)
+            handles = [c.create_rectangle(0, 0, 0, 0, outline="#003300", fill="#00ff00") for _ in range(8)]
+            label = c.create_text(0, 0, anchor="sw", fill="#00ff00", font=("Segoe UI", 9))
+            self._cam_popup_box_ids = (rect, handles, label)
+        rect, handles, label = self._cam_popup_box_ids
+        c.coords(rect, x1, y1, x2, y2)
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        s = 4
+        for hid, (hx, hy) in zip(handles, ((x1, y1), (mx, y1), (x2, y1), (x2, my),
+                                           (x2, y2), (mx, y2), (x1, y2), (x1, my))):
+            c.coords(hid, hx - s, hy - s, hx + s, hy + s)
+        rx1, ry1, rx2, ry2 = self._webcam_roi
+        c.coords(label, x1, y1 - 6)
+        c.itemconfig(label, text=f"{rx2 - rx1} × {ry2 - ry1}")
+        for item in (rect, *handles, label):
+            c.tag_raise(item)
+
+    def _cam_popup_hit(self, cx, cy):
+        """'' outside the box, 'move' inside, else the edges to drag ('n', 'se', ...)."""
+        x1, y1, x2, y2 = self._roi_to_canvas(self._webcam_roi)
+        tol = self._ROI_HANDLE_PX
+        if not (x1 - tol <= cx <= x2 + tol and y1 - tol <= cy <= y2 + tol):
+            return ""
+        edge = ""
+        if abs(cy - y1) <= tol:
+            edge += "n"
+        elif abs(cy - y2) <= tol:
+            edge += "s"
+        if abs(cx - x1) <= tol:
+            edge += "w"
+        elif abs(cx - x2) <= tol:
+            edge += "e"
+        if edge:
+            return edge
+        return "move" if (x1 < cx < x2 and y1 < cy < y2) else ""
+
+    def _cam_popup_hover(self, event):
+        if self._cam_popup_geom is None or self._cam_popup_drag is not None:
+            return
+        self._cam_popup_canvas.configure(cursor=self._ROI_CURSORS[self._cam_popup_hit(event.x, event.y)])
+
     def _cam_popup_mouse_down(self, event):
-        self._cam_popup_drawing = True
-        fx, fy = self._cam_popup_to_frame(event.x, event.y)
-        self._cam_popup_box_start = (fx, fy)
+        if self._cam_popup_geom is None:
+            return
+        self._cam_popup.focus_force()
+        mode = self._cam_popup_hit(event.x, event.y) or "new"
+        self._cam_popup_drag = {
+            "mode": mode,
+            "start": self._cam_popup_to_frame(event.x, event.y),
+            "roi": tuple(self._webcam_roi),
+        }
 
     def _cam_popup_mouse_drag(self, event):
-        pass
+        d = self._cam_popup_drag
+        if d is None or self._cam_popup_geom is None:
+            return
+        _scale, _ox, _oy, fw, fh = self._cam_popup_geom
+        m = self._ROI_MIN
+        fx, fy = self._cam_popup_to_frame(event.x, event.y)
+        sx, sy = d["start"]
+        x1, y1, x2, y2 = d["roi"]
+        mode = d["mode"]
+        if mode == "new":
+            roi = (min(sx, fx), min(sy, fy), max(sx, fx), max(sy, fy))
+        elif mode == "move":
+            dx = max(-x1, min(fx - sx, fw - x2))
+            dy = max(-y1, min(fy - sy, fh - y2))
+            roi = (x1 + dx, y1 + dy, x2 + dx, y2 + dy)
+        else:
+            if "w" in mode:
+                x1 = max(0, min(fx, x2 - m))
+            if "e" in mode:
+                x2 = min(fw, max(fx, x1 + m))
+            if "n" in mode:
+                y1 = max(0, min(fy, y2 - m))
+            if "s" in mode:
+                y2 = min(fh, max(fy, y1 + m))
+            roi = (x1, y1, x2, y2)
+        # Live on screen only; the OCR gets the box on release.
+        self._set_webcam_roi(roi, apply_to_ocr=False)
+        self._cam_popup_draw_box()
 
     def _cam_popup_mouse_up(self, event):
-        if not self._cam_popup_drawing:
+        d = self._cam_popup_drag
+        if d is None:
             return
-        self._cam_popup_drawing = False
-        fx, fy = self._cam_popup_to_frame(event.x, event.y)
-        sx, sy = self._cam_popup_box_start
-        x1, y1 = min(sx, fx), min(sy, fy)
-        x2, y2 = max(sx, fx), max(sy, fy)
-        if (x2 - x1) > 10 and (y2 - y1) > 10:
-            self._webcam_roi = (x1, y1, x2, y2)
-            if self.webcam_ocr:
-                self.webcam_ocr.roi.x1 = x1
-                self.webcam_ocr.roi.y1 = y1
-                self.webcam_ocr.roi.x2 = x2
-                self.webcam_ocr.roi.y2 = y2
+        self._cam_popup_mouse_drag(event)
+        self._cam_popup_drag = None
+        x1, y1, x2, y2 = self._webcam_roi
+        if (x2 - x1) < self._ROI_MIN or (y2 - y1) < self._ROI_MIN:
+            # A click or tiny drag outside the box keeps the old box.
+            self._set_webcam_roi(d["roi"])
+        else:
+            self._set_webcam_roi(self._webcam_roi)
+        self._cam_popup_draw_box()
+        self._cam_popup_hover(event)
+
+    def _cam_popup_nudge(self, dx, dy):
+        if self._cam_popup_geom is None or self._cam_popup_drag is not None:
+            return "break"
+        _scale, _ox, _oy, fw, fh = self._cam_popup_geom
+        x1, y1, x2, y2 = self._webcam_roi
+        dx = max(-x1, min(dx, fw - x2))
+        dy = max(-y1, min(dy, fh - y2))
+        self._set_webcam_roi((x1 + dx, y1 + dy, x2 + dx, y2 + dy))
+        self._cam_popup_draw_box()
+        return "break"
 
     def _start_capture_cam_preview(self):
         self._capture_cam_tick()
@@ -1027,6 +1371,7 @@ class App(tk.Tk):
         if self.webcam_ocr:
             self.webcam_ocr.camera_latency_ms = ms
             self.sync_lag_seconds = ms / 1000.0
+            self._reset_lag_tracking()  # typed-in value is the new starting point
             self.sync_status_var.set(f"Sync: webcam (lag {ms:.0f} ms)")
 
     def _on_ocr_source_change(self):
@@ -1115,7 +1460,7 @@ class App(tk.Tk):
         if WebcamOCR is None or not _HAS_WEBCAM_DEPS:
             if show_error:
                 messagebox.showerror("Missing dependencies",
-                                     "Install opencv-python, Pillow, and rapidocr-onnxruntime")
+                                     "Install opencv-python, Pillow, and rapidocr")
             return
         if self._camera_scan_active:
             # A background camera probe is using the DirectShow/MSMF backend
@@ -1168,7 +1513,10 @@ class App(tk.Tk):
                 wc.on_reading = self._on_ocr_reading
                 wc.start()
             except Exception as exc:
-                self.after(0, lambda: self._on_webcam_connect_failed(token, exc, show_error))
+                # Bind exc now: Python deletes it when the except block ends,
+                # so a plain closure raised NameError later and the failure
+                # was never reported (status stuck on "Connecting…").
+                self.after(0, lambda e=exc: self._on_webcam_connect_failed(token, e, show_error))
                 return
             self.after(0, lambda: self._on_webcam_connected(token, wc, cam, cam_name, remember))
 
@@ -1188,13 +1536,20 @@ class App(tk.Tk):
             # the integrated camera silently replaced the preferred camera.
             self._camera_prefs["camera_name"] = cam_name
             save_camera_prefs(cam_name)
-        # Sync lag = camera latency. The OCR pc_time is when the
-        # frame arrived on the PC; the display showed that number
-        # camera_latency_ms earlier.
-        cam_ms = wc.camera_latency_ms
-        self.sync_lag_seconds = cam_ms / 1000.0
-        self.sync_confidence = 1.0
-        self.sync_status_var.set(f"Sync: webcam (lag {cam_ms:.0f} ms)")
+        # Starting lag: the one measured last session if there is one (same
+        # camera and display, so it's the best guess), else Cam Latency.
+        # The estimator then refines it continuously from live data.
+        saved = load_sync_state()
+        if saved.get("confidence", 0.0) >= 0.65 and not saved.get("manual"):
+            start_ms = saved["lag_ms"]
+            source = "measured last session"
+        else:
+            start_ms = wc.camera_latency_ms
+            source = "Cam Latency"
+        self.sync_lag_seconds = start_ms / 1000.0
+        self.sync_confidence = 0.0
+        self._reset_lag_tracking()  # new camera: re-measure from scratch
+        self.sync_status_var.set(f"Sync: starting at {start_ms:.0f} ms ({source})")
         self.webcam_start_btn_var.set("Stop Webcam OCR")
         self.webcam_status_var.set(f"Webcam OCR running (cam {cam})")
         self.ocr_source_var.set("webcam")
@@ -1241,25 +1596,91 @@ class App(tk.Tk):
             self._webcam_roi = (w // 4, h // 4, 3 * w // 4, 3 * h // 4)
         else:
             self._webcam_roi = (540, 322, 740, 397)
-        if self.webcam_ocr:
-            x1, y1, x2, y2 = self._webcam_roi
-            self.webcam_ocr.roi.x1 = x1
-            self.webcam_ocr.roi.y1 = y1
-            self.webcam_ocr.roi.x2 = x2
-            self.webcam_ocr.roi.y2 = y2
+        self._set_webcam_roi(self._webcam_roi)
+        if self._cam_popup_canvas is not None:
+            self._cam_popup_draw_box()
+
+    def _scrollable(self, parent) -> ttk.Frame:
+        """A frame inside `parent` that scrolls vertically (scrollbar and mouse
+        wheel) when its contents are taller than the window."""
+        bg = ttk.Style().lookup("TFrame", "background") or self.cget("background")
+        canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0, background=bg)
+        bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=bar.set)
+
+        def update_bar(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # Only show the scrollbar when there's something to scroll.
+            if inner.winfo_reqheight() > canvas.winfo_height():
+                bar.pack(side="right", fill="y")
+            else:
+                bar.pack_forget()
+                canvas.yview_moveto(0)
+
+        inner.bind("<Configure>", update_bar)
+        canvas.bind("<Configure>", lambda e: (canvas.itemconfigure(window, width=e.width), update_bar()))
+
+        def on_wheel(e):
+            if inner.winfo_reqheight() > canvas.winfo_height():
+                canvas.yview_scroll(int(-e.delta / 120), "units")
+
+        # Wheel scrolls this tab only while the pointer is over it.
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", on_wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        canvas.pack(side="left", fill="both", expand=True)
+        return inner
 
     def _build_connection_tab(self, root):
         pad = {"padx": 10, "pady": 8}
 
         gps_box = ttk.LabelFrame(root, text="Gravity / GPS")
         gps_box.pack(fill="x", **pad)
-        ttk.Label(gps_box, textvariable=self.gps_status_var).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=6)
-        ttk.Label(gps_box, text="MF Override").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(gps_box, textvariable=self.gps_status_var).grid(row=0, column=0, columnspan=6, sticky="w", padx=6, pady=6)
+
+        ttk.Label(gps_box, text="Latitude (° N)").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        lat_entry = ttk.Entry(gps_box, textvariable=self.loc_lat_var, width=12)
+        lat_entry.grid(row=1, column=1, sticky="w", pady=6)
+        elev_row = ttk.Frame(gps_box)
+        elev_row.grid(row=1, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=6)
+        ttk.Label(elev_row, text="Elevation").pack(side="left")
+        elev_entry = ttk.Entry(elev_row, textvariable=self.loc_elev_var, width=10)
+        elev_entry.pack(side="left", padx=(6, 2))
+        ttk.Combobox(elev_row, textvariable=self.loc_elev_unit_var, values=["ft", "m"],
+                     state="readonly", width=4).pack(side="left")
+        ttk.Button(gps_box, text="Apply", command=self._apply_location).grid(row=1, column=4, sticky="w", padx=6)
+        hint_row = ttk.Frame(gps_box)
+        hint_row.grid(row=1, column=5, sticky="w", padx=(10, 6), pady=6)
+        ttk.Label(hint_row, text="N value + elevation from an altimeter app (W not needed). Blank both to clear.").pack(side="left")
+        self._mf_link = ttk.Label(hint_row, text="Enter MF directly", foreground="#1a5fb4",
+                                  cursor="hand2", font=("Segoe UI", 9, "underline"))
+        self._mf_link.pack(side="left", padx=(12, 0))
+        self._mf_link.bind("<Button-1>", lambda _e: self._toggle_mf_row())
+        for w in (lat_entry, elev_entry):
+            w.bind("<Return>", lambda _e: self._apply_location())
+
+        mf_label = ttk.Label(gps_box, text="MF Override")
+        mf_label.grid(row=2, column=0, sticky="w", padx=6, pady=6)
         mf_entry = ttk.Entry(gps_box, textvariable=self.mf_override_var, width=12)
-        mf_entry.grid(row=1, column=1, sticky="w", pady=6)
-        ttk.Button(gps_box, text="Apply", command=self._apply_mf_override).grid(row=1, column=2, sticky="w", padx=6)
-        ttk.Label(gps_box, text="Leave blank to use GPS (or 1.0 if no GPS)").grid(
-            row=1, column=3, sticky="w", padx=(10, 6), pady=6)
+        mf_entry.grid(row=2, column=1, sticky="w", pady=6)
+        mf_entry.bind("<Return>", lambda _e: self._apply_mf_override())
+        mf_apply = ttk.Button(gps_box, text="Apply", command=self._apply_mf_override)
+        mf_apply.grid(row=2, column=4, sticky="w", padx=6)
+        mf_hint = ttk.Label(gps_box, text="Overrides the location MF. Clear and Apply to go back.")
+        mf_hint.grid(row=2, column=5, sticky="w", padx=(10, 6), pady=6)
+        self._mf_row_widgets = (mf_label, mf_entry, mf_apply, mf_hint)
+        self._mf_row_visible = True
+        self._set_mf_row_visible(False)
+
+        dp_box = ttk.LabelFrame(root, text="Decimal point")
+        dp_box.pack(fill="x", **pad)
+        ttk.Label(dp_box, text="Decimal places").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        ttk.Combobox(dp_box, textvariable=self.decimal_point_var, values=DECIMAL_POINT_OPTIONS,
+                     state="readonly", width=6).grid(row=0, column=1, sticky="w", pady=6)
+        ttk.Label(dp_box, text="When the OCR misses the display's decimal point (98765 for 987.65): "
+                               "Auto matches it to the HADI, 0–5 always places it, Off shows it as read."
+                  ).grid(row=0, column=2, sticky="w", padx=(10, 6), pady=6)
 
         webcam_box = ttk.LabelFrame(root, text="Webcam OCR")
         webcam_box.pack(fill="x", **pad)
@@ -1300,6 +1721,8 @@ class App(tk.Tk):
         ttk.Label(webcam_status_frame, text="  |  Reading:").pack(side="left", padx=(12, 2))
         ttk.Label(webcam_status_frame, textvariable=self.webcam_reading_var,
                   font=("Consolas", 12, "bold")).pack(side="left")
+        ttk.Label(webcam_box, textvariable=self.sync_status_var).grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
 
         box = ttk.LabelFrame(root, text="Detailed Connections")
         box.pack(fill="x", **pad)
@@ -1323,13 +1746,6 @@ class App(tk.Tk):
         ttk.Button(box, text="Apply", command=self._apply_poll_rate).grid(row=2, column=2, sticky="w", padx=6)
 
         ttk.Label(box, textvariable=self.status_var).grid(row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(12, 6))
-
-        sync_box = ttk.LabelFrame(root, text="Sync Calibration")
-        sync_box.pack(fill="x", **pad)
-        ttk.Label(sync_box, textvariable=self.sync_status_var).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(6, 2))
-        ttk.Label(sync_box, text="Cal lag (ms)").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(sync_box, textvariable=self.cal_lag_ms_var, width=8).grid(row=1, column=1, sticky="w", pady=6)
-        ttk.Button(sync_box, text="Set", command=self._apply_calibration_lag).grid(row=1, column=2, sticky="w", padx=6)
 
         med_box = ttk.LabelFrame(root, text="Capture Median")
         med_box.pack(fill="x", **pad)
@@ -1379,6 +1795,27 @@ class App(tk.Tk):
         ttk.Button(top, text="New", command=self._new_load_cell).grid(row=0, column=2, padx=6)
         ttk.Button(top, text="Save / Update", command=self._save_load_cell_from_editor).grid(row=0, column=3, padx=6)
         ttk.Button(top, text="Delete", command=self._delete_load_cell).grid(row=0, column=4, padx=6)
+        # Move cells between computers/versions: a small JSON file.
+        ttk.Button(top, text="Export…", command=self._export_load_cells).grid(row=0, column=5, padx=(18, 6))
+        ttk.Button(top, text="Import…", command=self._import_load_cells).grid(row=0, column=6, padx=6)
+
+        # Packed (before the coefficients form) at the bottom of the tab, with a
+        # clear gap above it, so it's set apart from editing the saved cells.
+        bz = ttk.LabelFrame(root, text="Better Zero")
+        bz.pack(side="bottom", fill="x", padx=10, pady=(40, 14))
+        # Off every launch; while ticked, every load cell's B0 is treated as 0.
+        bz_check = ttk.Checkbutton(bz, text="Better Zero", variable=self.zero_b0_var,
+                                   command=self._on_zero_b0_toggle)
+        bz_check.grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        bz_text = ttk.Label(bz, text="When on, whichever load cell is selected has its B0 set to 0 (tension and "
+                                     "compression) until you uncheck this. Temporary: the saved coefficients "
+                                     "above are not changed, and it's off again next time the app opens.",
+                            wraplength=600)
+        bz_text.grid(row=0, column=1, sticky="w", padx=(10, 6), pady=6)
+        bz.columnconfigure(1, weight=1)
+        # Wrap to whatever width the window has, so nothing is cut off.
+        bz.bind("<Configure>", lambda e: bz_text.configure(
+            wraplength=max(200, e.width - bz_check.winfo_reqwidth() - 50)))
 
         form = ttk.LabelFrame(root, text="Load Cell Calibration Coefficients")
         form.pack(fill="both", expand=True, **pad)
@@ -1781,6 +2218,258 @@ class App(tk.Tk):
     def _release_button_focus(self, _event=None):
         self.after(1, self.focus_set)
 
+    # A row's OCR reading is kept in two layers once units start changing:
+    #   basis    (ocr_original*): what the current display is derived from.
+    #            Convert re-derives from it; Don't convert re-labels it.
+    #   captured (ocr_cap*):      the reading as captured/typed. A units change
+    #            never touches it; "Restore original" rebuilds from it.
+    _OCR_BASIS_KEYS = ("ocr_original", "ocr_text_original", "ocr_original_units")
+    _OCR_CAPTURED_KEYS = ("ocr_cap", "ocr_text_cap", "ocr_cap_units")
+    # Cleared when a reading is edited or recaptured: the new value is the
+    # new "as captured" in whatever units are showing.
+    _OCR_ORIGINAL_KEYS = _OCR_BASIS_KEYS + _OCR_CAPTURED_KEYS
+
+    def _on_hadi_units_selected(self):
+        """Convert captured OCR values along with HADI to the new units.
+
+        Both columns scale by the same factor, so % error is unchanged. The
+        reading as captured is set aside on the row, and switching back to
+        those units restores it exactly — the conversion never loses the
+        original. mV/V isn't a force unit, so OCR isn't converted to/from it.
+        """
+        new_units = self.hadi_units_var.get()
+        old_units = self._applied_hadi_units
+        if new_units == old_units:
+            return
+        has_data = self._has_capture_data()
+        old_capacity = self.customer_capacity_var.get().strip()
+        if not has_data and not old_capacity:
+            # Nothing captured or typed: nothing to restore later either.
+            self._units_original = None
+            self._capacity_captured = None
+        convert = True
+        if has_data or old_capacity:
+            # Once units have been changed, Restore is offered in every units
+            # dialog, whichever units were picked: it always goes back to the
+            # original units with readings as captured and Capacity as typed.
+            restore_units = self._units_original
+            if self._units_original is None:
+                self._units_original = old_units
+            choice = self._ask_units_choice(old_units, new_units, restore_units)
+            if choice is None:
+                self.hadi_units_var.set(old_units)
+                return
+            if choice == "restore":
+                self._restore_original(old_units)
+                return
+            convert = choice == "convert"
+        self._applied_hadi_units = new_units
+        rows = self._rows_with_ocr()
+        # Remember what was captured/typed before anything changes it.
+        self._record_capacity_captured(old_units)
+        for row in rows:
+            self._record_row_captured(row, old_units)
+        if convert:
+            capacity_text, capacity_state = self._capacity_in_units(old_units, new_units)
+            if old_capacity:
+                self._capacity_state = capacity_state
+                self.customer_capacity_var.set(capacity_text)
+            for row in rows:
+                self._convert_row_ocr_units(row, old_units, new_units)
+            toast = f"Converted to {new_units}"
+            if old_capacity and capacity_text != old_capacity:
+                toast += f" — Capacity {old_capacity} {old_units} → {capacity_text} {new_units}"
+        else:
+            # The numbers on screen were really in the new units all along
+            # (e.g. Units was set wrong while capturing): keep them, and
+            # re-judge everything against the HADI in the new units. Only the
+            # basis is re-labelled; "as captured" is kept for Restore.
+            self._capacity_state = ({"text": old_capacity, "units": new_units, "shown": old_capacity}
+                                    if old_capacity else None)
+            for row in rows:
+                row["ocr_original"] = row["ocr"]
+                row["ocr_text_original"] = row.get("ocr_text", "")
+                row["ocr_original_units"] = new_units
+                self._recalculate_row_error(row)
+            if old_capacity:
+                self._regenerate_targets()
+            toast = f"Units now {new_units} — numbers kept, % error recalculated"
+            if old_capacity:
+                toast = f"Units now {new_units} — Capacity kept at {old_capacity} {new_units}, targets updated"
+        self._set_hadi_display_options()
+        if has_data or old_capacity:
+            self._show_capacity_toast(toast)
+        if rows:
+            self._mark_data_changed()
+
+    def _rows_with_ocr(self) -> list:
+        return [point_row[k] for point_row in self.capture_rows for k in ("run1", "run2")
+                if point_row.get(k) and point_row[k].get("ocr") not in (None, "")]
+
+    def _record_row_captured(self, row: dict, units: str) -> None:
+        """First units change a reading goes through: remember it as captured."""
+        if "ocr_cap" not in row:
+            row["ocr_cap"] = row["ocr"]
+            row["ocr_text_cap"] = row.get("ocr_text", "")
+            row["ocr_cap_units"] = units
+
+    def _record_capacity_captured(self, units: str) -> None:
+        """Remember the Capacity as typed. If the box was edited since the last
+        units change, the new text is the new 'as typed' value (in `units`)."""
+        text = self.customer_capacity_var.get().strip()
+        if not text:
+            return
+        state = self._capacity_state
+        edited = state is None or state.get("shown") != text
+        if self._capacity_captured is None or edited:
+            self._capacity_captured = {"text": text, "units": units}
+
+    def _restore_original(self, current_units: str) -> None:
+        """Put every reading back as captured and the Capacity back as typed,
+        in the units used before the first units change. Points captured
+        since then are kept, converted to those units (same force)."""
+        orig = self._units_original
+        self._record_capacity_captured(current_units)
+        for row in self._rows_with_ocr():
+            self._record_row_captured(row, current_units)   # captured since a change
+            row["ocr_original"] = row["ocr_cap"]
+            row["ocr_text_original"] = row["ocr_text_cap"]
+            row["ocr_original_units"] = row["ocr_cap_units"]
+            self._convert_row_ocr_units(row, current_units, orig)
+        self._applied_hadi_units = orig
+        self.hadi_units_var.set(orig)
+        for row in self._rows_with_ocr():
+            self._recalculate_row_error(row)
+        cap = self._capacity_captured
+        if cap is not None:
+            self._capacity_state = dict(cap, shown=self.customer_capacity_var.get().strip())
+            text, state = self._capacity_in_units(current_units, orig)
+            self._capacity_state = state
+            self.customer_capacity_var.set(text)
+            self._regenerate_targets()
+        self._set_hadi_display_options()
+        self._show_capacity_toast(f"Restored — readings and Capacity back to the original {orig} values")
+        self._mark_data_changed()
+
+    def _ask_units_choice(self, old_units: str, new_units: str, restore_units: Optional[str]):
+        """Units-change dialog. Returns 'restore', 'convert', 'keep' or None
+        (cancel). A custom dialog because it can have four choices."""
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Change units to {new_units}?")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        result = {"value": None}
+
+        def choose(value):
+            result["value"] = value
+            dlg.destroy()
+
+        ttk.Label(dlg, text="Units should match what the device's display shows.",
+                  padding=(14, 12, 14, 6)).pack(anchor="w")
+
+        def option(label, desc, value):
+            row = ttk.Frame(dlg, padding=(14, 4))
+            row.pack(fill="x")
+            ttk.Button(row, text=label, width=20, command=lambda: choose(value)).pack(side="left")
+            ttk.Label(row, text=desc, wraplength=380).pack(side="left", padx=(10, 0))
+
+        if restore_units:
+            option(f"Restore original ({restore_units})",
+                   f"back to {restore_units}: every reading as captured and Capacity as typed, "
+                   "exactly as before any units change", "restore")
+        option(f"Convert to {new_units}", "same force: readings, Capacity and targets convert; "
+                                          "% error unchanged", "convert")
+        option("Don't convert", f"numbers stay as they are and are used as {new_units}; "
+                                "HADI and % error are recalculated", "keep")
+        option("Cancel", f"keep {old_units}", None)
+        ttk.Frame(dlg, height=8).pack()
+        dlg.bind("<Escape>", lambda _e: choose(None))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+        dlg.focus_set()
+        self.wait_window(dlg)
+        return result["value"]
+
+    def _show_capacity_toast(self, text: str, ms: int = 2500) -> None:
+        """Briefly show what a units change did, just above the Capacity box."""
+        toast = getattr(self, "_capacity_toast", None)
+        if toast is None:
+            toast = self._capacity_toast = tk.Label(
+                self, bg="#1a5fb4", fg="white", font=("Segoe UI", 9, "bold"), padx=8, pady=3)
+        toast.configure(text=text)
+        toast.place(in_=self._capacity_entry, relx=0.0, rely=0.0, anchor="sw", y=-4)
+        toast.lift()
+        if getattr(self, "_capacity_toast_after", None):
+            self.after_cancel(self._capacity_toast_after)
+        self._capacity_toast_after = self.after(ms, toast.place_forget)
+
+    def _convert_row_ocr_units(self, row: dict, old_units: str, new_units: str) -> bool:
+        if "ocr_original" not in row:
+            row["ocr_original"] = row["ocr"]
+            row["ocr_text_original"] = row.get("ocr_text", "")
+            row["ocr_original_units"] = old_units
+        orig_units = row["ocr_original_units"]
+        if new_units == orig_units:
+            row["ocr"] = row["ocr_original"]
+            row["ocr_text"] = row["ocr_text_original"]
+            return True
+        f_from = HADI_UNIT_FACTORS.get(orig_units)
+        f_to = HADI_UNIT_FACTORS.get(new_units)
+        if f_from is None or f_to is None:
+            # mV/V on either side: show the reading as captured.
+            row["ocr"] = row["ocr_original"]
+            row["ocr_text"] = row["ocr_text_original"]
+            return True
+        try:
+            value = float(row["ocr_original"]) / f_from * f_to
+        except (TypeError, ValueError):
+            return False
+        # Keep the display's resolution: 987.65 lbf -> 4393.29 N, 4.39329 kN.
+        ratio = f_to / f_from
+        decimals = self._decimal_places(row["ocr_text_original"]) + math.ceil(round(-math.log10(ratio), 9))
+        row["ocr"] = value
+        row["ocr_text"] = self._fixed_decimals(value, max(0, decimals))
+        return True
+
+    def _capacity_in_units(self, old_units: str, new_units: str):
+        """The Capacity field converted to `new_units` (same physical force).
+
+        Returns (text, state). Converts from the value as originally typed,
+        so 1000 LBF -> 4448.22 N -> 1000 LBF comes back exactly; if the field
+        was edited since the last conversion, what's there now is the new
+        original. mV/V isn't a force unit, so it's left as typed.
+        """
+        text = self.customer_capacity_var.get().strip()
+        state = getattr(self, "_capacity_state", None)
+        if state is None or state["shown"] != text:
+            state = {"text": text, "units": old_units}
+        if not text:
+            return "", None
+        if new_units == state["units"]:
+            # Keep the state (not None): its units may differ from the
+            # as-typed value after a Don't convert, and Restore needs that.
+            return state["text"], dict(state, shown=state["text"])
+        f_from = HADI_UNIT_FACTORS.get(state["units"])
+        f_to = HADI_UNIT_FACTORS.get(new_units)
+        try:
+            value = float(state["text"]) / f_from * f_to
+        except (TypeError, ValueError):
+            # mV/V on either side (or not a number): leave it as typed, but
+            # remember its real units so LBF -> mV/V -> N still converts.
+            return text, dict(state, shown=text)
+        new_text = f"{value:.6g}"
+        return new_text, dict(state, shown=new_text)
+
+    def _carry_ocr_original(self, old_row: dict, new_row: dict) -> None:
+        """Keep the as-captured OCR reading when a row is rebuilt (W rows)."""
+        if "ocr_original" in old_row and new_row.get("ocr") not in (None, ""):
+            for key in self._OCR_ORIGINAL_KEYS:
+                new_row[key] = old_row[key]
+
     def _set_hadi_display_options(self):
         units = self.hadi_units_var.get()
         self.hadi_title_var.set("HADI Response (mV/V)" if units == "mV/V" else f"HADI Force ({units})")
@@ -1879,7 +2568,7 @@ class App(tk.Tk):
 
     def _format_hadi_display_value(self, reading: HADIReading) -> str:
         units = self.hadi_units_var.get()
-        decimals = _decimals_from_step(self.hadi_decimals_var.get())
+        decimals = self._selected_hadi_decimals()
         if units == "mV/V":
             value = reading.raw_response
         else:
@@ -1904,24 +2593,43 @@ class App(tk.Tk):
         if units == "mV/V":
             return f"{force_lbf:.1f} LBF"
         factor = HADI_UNIT_FACTORS.get(units, 1.0)
-        decimals = _decimals_from_step(self.hadi_decimals_var.get())
+        decimals = self._selected_hadi_decimals()
         return f"{force_lbf * factor:.{decimals}f} {units}"
 
-    def _selected_hadi_decimals(self) -> int:
-        """Number of decimal places selected for HADI display/capture output."""
-        return _decimals_from_step(self.hadi_decimals_var.get())
+    def _selected_hadi_decimals(self, ocr_text=None) -> int:
+        """Number of decimal places for HADI display/capture output.
 
-    def _format_hadi_lbf_text(self, value, show_plus: bool = False) -> str:
+        Dec = Auto shows the HADI with one more decimal than the OCR reading:
+        a captured row uses its own OCR text, the live readout the latest OCR
+        reading (or the last one seen if the camera has lost the number).
+        Never more than 5 decimals, and 5 before any OCR reading.
+        """
+        step = self.hadi_decimals_var.get()
+        if step != "Auto":
+            return _decimals_from_step(step)
+        if ocr_text not in (None, ""):
+            ocr_decimals = self._decimal_places(ocr_text)
+        else:
+            ocr_decimals = self._last_ocr_decimals
+            if ocr_decimals is None:
+                return self.HADI_MAX_DECIMALS
+        return min(ocr_decimals + 1, self.HADI_MAX_DECIMALS)
+
+    # The finest HADI resolution offered (Dec 0.00001); Auto never goes past it.
+    HADI_MAX_DECIMALS = 5
+
+    def _format_hadi_lbf_text(self, value, show_plus: bool = False, ocr_text=None) -> str:
         """Format captured HADI LBF with exactly the selected decimal count.
 
         Capture rows keep this text so the table, autosave, and manual CSV export
         all preserve the same decimal precision the operator selected at capture
-        time instead of later shortening/reformatting the float.
+        time instead of later shortening/reformatting the float. `ocr_text` is
+        the row's OCR reading, which sets the precision when Dec = Auto.
         """
         if value in (None, ""):
             return ""
         try:
-            decimals = self._selected_hadi_decimals()
+            decimals = self._selected_hadi_decimals(ocr_text)
             sign = "+" if show_plus else ""
             v = float(value)
             return f"{v:{sign}.{decimals}f}"
@@ -1937,7 +2645,8 @@ class App(tk.Tk):
                     _raw = row.get("hadi_raw")
                     _raw_f = float(_raw) if _raw not in (None, "") else None
                     display_val = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=_raw_f)
-                    row["hadi_text"] = self._format_hadi_lbf_text(display_val, show_plus=False)
+                    row["hadi_text"] = self._format_hadi_lbf_text(
+                        display_val, show_plus=False, ocr_text=row.get("ocr_text"))
                 except (TypeError, ValueError):
                     row["hadi_text"] = ""
             else:
@@ -1962,52 +2671,42 @@ class App(tk.Tk):
             self._hadi_overload = False
             self._hadi_overload_text = ""
 
-    def _update_ocr_overload_warning(self) -> None:
-        """Check OCR overload (105% of customer capacity in display units)."""
-        raw = self.customer_capacity_var.get().strip()
-        if not raw:
-            self._ocr_overload = False
-            self._ocr_overload_text = ""
-            return
+    def _update_device_overload(self) -> None:
+        """Device under test past 105% of its Capacity.
+
+        Judged from the HADI force: the reference cell and the device are in
+        series, so they carry the same force, and the HADI value is exact.
+        Units, a camera misread, a missed decimal point, or a lost/frozen
+        display can't hide an overload or fake one. Only when there's no live
+        HADI reading (e.g. weight rows) does it fall back to the camera value.
+        """
+        self._device_overload = False
         try:
-            capacity = float(raw)
+            capacity = float(self.customer_capacity_var.get().strip())
         except ValueError:
-            self._ocr_overload = False
-            self._ocr_overload_text = ""
             return
         if capacity <= 0:
-            self._ocr_overload = False
-            self._ocr_overload_text = ""
             return
-
+        limit = capacity * 1.05
+        units = self.hadi_units_var.get()
+        reading = self.latest_hadi          # None once HADI readings go stale
+        if reading is not None and self.selected_load_cell_name.get():
+            if units == "mV/V":
+                self._device_overload = abs(reading.raw_response) >= limit
+            else:
+                self._device_overload = abs(reading.force_lbf) >= self._display_to_lbf(limit)
+            return
         with self.ocr_lock:
             ocr = self.latest_ocr
-        if ocr is None:
-            self._ocr_overload = False
-            self._ocr_overload_text = ""
-            return
-
-        ocr_abs = abs(float(ocr.value))
-        limit = capacity * 1.05
-        if ocr_abs >= limit:
-            units = self.hadi_units_var.get()
-            if units == "mV/V":
-                units = ""
-            decimals = _decimals_from_step(self.hadi_decimals_var.get())
-            self._ocr_overload = True
-            self._ocr_overload_text = (
-                f"OCR OVERLOAD  {ocr_abs:.{decimals}f} / {limit:.{decimals}f} {units} max"
-            )
-        else:
-            self._ocr_overload = False
-            self._ocr_overload_text = ""
+        if ocr is not None:
+            self._device_overload = abs(float(ocr.value)) >= limit
 
     def _update_overload_badge(self) -> None:
         parts = []
         if getattr(self, "_hadi_overload", False):
             parts.append("HADI OVERLOAD")
-        if getattr(self, "_ocr_overload", False):
-            parts.append("OCR OVERLOAD")
+        if getattr(self, "_device_overload", False):
+            parts.append("DEVICE OVERLOAD")
 
         if parts:
             self.overload_badge_var.set("  |  ".join(parts))
@@ -2040,8 +2739,23 @@ class App(tk.Tk):
 
     def _auto_connect_on_launch(self, attempt: int = 1):
         if WebcamOCR is not None and _HAS_WEBCAM_DEPS:
-            preferred = self._camera_prefs.get("camera_name") or DEFAULT_CAMERA_NAME
+            saved = self._camera_prefs.get("camera_name")
+            preferred = saved or DEFAULT_CAMERA_NAME
             label = self._label_for_camera_name(preferred)
+            available = list(self.settings_cam_combo["values"])
+            if label is None and not saved and attempt >= 3:
+                # First run on a new computer: nobody has chosen a camera yet,
+                # so there's no choice to override. One camera -> use it;
+                # several -> ask, rather than guess (it could be the laptop's
+                # built-in camera pointing at the operator).
+                if len(available) == 1:
+                    label = available[0]
+                else:
+                    self.webcam_status_var.set(
+                        "Choose the camera pointed at the display: Settings → Webcam OCR → Camera"
+                        if available else "No camera found — plug one in, then press Refresh Cameras.")
+                    self._kick_auto_scan()
+                    return
             if label is not None:
                 self.webcam_cam_var.set(label)
                 # Quiet on launch: a busy camera shows in the status label
@@ -2051,7 +2765,8 @@ class App(tk.Tk):
                 # USB cameras can enumerate late after boot/replug, so rescan
                 # before giving up on the saved default.
                 self.webcam_status_var.set(
-                    f"Looking for default camera '{preferred}' (scan {attempt + 1}/3)…")
+                    f"Looking for camera '{preferred}' (scan {attempt + 1}/3)…" if saved
+                    else f"Looking for cameras (scan {attempt + 1}/3)…")
                 self.after(3000, lambda: self._refresh_camera_list(
                     then=lambda: self._auto_connect_on_launch(attempt + 1)))
             else:
@@ -2071,14 +2786,25 @@ class App(tk.Tk):
         """HADI light: flashing red while trying to connect, yellow when
         connected but no data yet, green while readings are flowing."""
         if not self.hadi.is_connected():
+            # A disconnect ends any yellow spell; time spent disconnected
+            # must not be reported as yellow on the next reading.
+            self._hadi_went_stale = None
             if self._auto_scan_active:
                 flash_on = int(now_pc / 0.4) % 2 == 0
                 self._set_hadi_light("#cc0000" if flash_on else "#4d0000")
             else:
                 self._set_hadi_light("#cc0000")
         elif self._hadi_is_fresh(now_pc):
+            if self._hadi_went_stale is not None:
+                log_freeze(f"HADI readings resumed after "
+                           f"{now_pc - self._hadi_went_stale:.1f} s yellow")
+                self._hadi_went_stale = None
             self._set_hadi_light("#00aa00")
         else:
+            if self._hadi_went_stale is None and self.hadi_last_pc_time is not None:
+                self._hadi_went_stale = now_pc
+                log_freeze(f"HADI yellow: connected but no reading for "
+                           f"{now_pc - self.hadi_last_pc_time:.1f} s")
             self._set_hadi_light("#ccaa00")
 
     def _set_ocr_light(self, color: str):
@@ -2125,6 +2851,9 @@ class App(tk.Tk):
     def _background_scan(self, baudrate: int):
         if list_ports is None:
             return
+        # The port that just errored may still be closing; probing it before
+        # that finishes fails with "Access is denied" and delays reconnect.
+        self.hadi.wait_closed(3.0)
         ports = [p.device for p in list_ports.comports()]
         if self._last_good_port and self._last_good_port in ports:
             ports.remove(self._last_good_port)
@@ -2133,18 +2862,20 @@ class App(tk.Tk):
             if self.hadi.is_connected():
                 return
             if HADIWorker.probe_port(port, baudrate):
-                self.after(0, lambda p=port: self._auto_connect_port(p))
+                self.after(0, lambda p=port, ps=ports: self._auto_connect_port(p, ps))
                 return
         self.after(0, self._on_scan_failed)
 
     def _on_scan_failed(self):
         self.status_var.set("HADI: no device found, retrying...")
 
-    def _auto_connect_port(self, port: str):
+    def _auto_connect_port(self, port: str, ports: list[str]):
         if self.hadi.is_connected():
             return
         self.port_var.set(port)
-        self._refresh_ports()
+        # Reuse the scan thread's port list: enumerating COM ports here
+        # (list_ports.comports) can take hundreds of ms on the Tk thread.
+        self.port_combo["values"] = ports
         try:
             self.hadi.connect(port, int(self.baud_var.get()))
             self._select_load_cell()
@@ -2153,6 +2884,7 @@ class App(tk.Tk):
             self.hadi_button_var.set("Disconnect HADI")
             self._last_good_port = port
             self.status_var.set(f"HADI connected on {port}")
+            log_freeze(f"HADI auto-connected on {port}")
         except Exception:
             self.status_var.set(f"HADI: probe OK but connect failed on {port}")
 
@@ -2186,7 +2918,7 @@ class App(tk.Tk):
                 messagebox.showerror("HADI connection failed", str(exc))
 
     def _disconnect_hadi(self):
-        self.hadi.disconnect()
+        self.hadi.disconnect(wait=False)
         self.hadi_button_var.set("Connect HADI")
         self.status_var.set("HADI disconnected")
         self.latest_hadi = None
@@ -2256,9 +2988,28 @@ class App(tk.Tk):
     def _select_load_cell(self):
         cell = self._find_load_cell(self.selected_load_cell_name.get())
         if cell:
-            self.hadi.load_cell = cell
-            self.status_var.set(f"Using load cell: {cell['name']}")
+            self.hadi.load_cell = self._effective_load_cell(cell)
+            zeroed = " (Better Zero on: B0 = 0)" if self.zero_b0_var.get() else ""
+            self.status_var.set(f"Using load cell: {cell['name']}{zeroed}")
             self._update_capacity_warning(self.latest_hadi)
+
+    def _effective_load_cell(self, cell: dict) -> dict:
+        """The coefficients the HADI force is computed with: the saved cell, or
+        with "Better Zero" ticked, a temporary copy with B0 = 0 on both sides.
+        The saved cell (and load_cells.json) is never changed."""
+        if not self.zero_b0_var.get():
+            return cell
+        temp = dict(cell)
+        for side in ("compression", "tension"):
+            temp[side] = dict(cell.get(side) or {}, B0=0.0)
+        return temp
+
+    def _on_zero_b0_toggle(self):
+        if self.selected_load_cell_name.get():
+            self._select_load_cell()
+        else:
+            self.status_var.set("Better Zero on: B0 = 0 for any load cell selected (temporary)"
+                                if self.zero_b0_var.get() else "Better Zero off: B0 back to the saved values")
 
     def _sync_load_cell_controls(self):
         names = [c["name"] for c in self.load_cells]
@@ -2382,11 +3133,171 @@ class App(tk.Tk):
             return
         if not name:
             return
+        # Calibration coefficients can't be recovered once deleted, so ask
+        # (default button: No).
+        if not messagebox.askyesno(
+                "Delete load cell?",
+                f"Delete the load cell '{name}' and its calibration coefficients?\n\n"
+                "This can't be undone. Tip: Export… it first if you might need it again.",
+                icon="warning", default="no"):
+            return
         self.load_cells = [c for c in self.load_cells if c["name"] != name]
         save_load_cells(self.load_cells)
         self.selected_load_cell_name.set(self.load_cells[0]["name"])
         self.editor_select_var.set(self.load_cells[0]["name"])
         self._sync_load_cell_controls()
+
+    def _export_load_cells(self):
+        """Save load cells to a small JSON file (same format as load_cells.json)."""
+        if not self.load_cells:
+            messagebox.showinfo("Export load cells", "There are no load cells to export.")
+            return
+        selected = self.editor_select_var.get()
+        cells = self.load_cells
+        if selected and len(self.load_cells) > 1:
+            choice = messagebox.askyesnocancel(
+                "Export load cells",
+                f"Export all {len(self.load_cells)} load cells?\n\n"
+                f"Yes — all {len(self.load_cells)}\nNo — only '{selected}'\nCancel — don't export")
+            if choice is None:
+                return
+            if choice is False:
+                cells = [c for c in self.load_cells if c["name"] == selected]
+        if len(cells) == 1:
+            stem = re.sub(r'[\\/:*?"<>|]+', "_", cells[0]["name"]).strip() or "load_cell"
+        else:
+            stem = f"load_cells_{datetime.now():%y%m%d}"
+        path = filedialog.asksaveasfilename(
+            title="Export load cells", defaultextension=".json", initialfile=f"{stem}.json",
+            filetypes=[("Load cell file", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            Path(path).write_text(json.dumps(cells, indent=2), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        messagebox.showinfo("Exported", f"Exported {len(cells)} load cell{'s' if len(cells) != 1 else ''} to:\n{path}")
+
+    @staticmethod
+    def _normalize_load_cell(raw) -> dict:
+        """Validate one imported load cell; raise ValueError if it isn't one."""
+        if not isinstance(raw, dict):
+            raise ValueError("not a load cell entry")
+        name = str(raw.get("name", "")).strip()
+        if not name:
+            raise ValueError("missing name")
+        capacity = raw.get("capacity_lbf")
+        if capacity not in (None, ""):
+            capacity = float(capacity)
+            if not math.isfinite(capacity) or capacity <= 0:
+                raise ValueError(f"'{name}': capacity must be a positive number")
+        else:
+            capacity = None
+        cell = {"name": name, "capacity_lbf": capacity}
+        for side in ("compression", "tension"):
+            coeffs = raw.get(side) or {}
+            if not isinstance(coeffs, dict):
+                raise ValueError(f"'{name}': {side} coefficients are not valid")
+            cell[side] = {}
+            for key in ("B0", "B1", "B2", "B3", "B4", "B5"):
+                value = float(coeffs.get(key, 0.0) or 0.0)
+                if not math.isfinite(value):
+                    raise ValueError(f"'{name}': {side} {key} is not a number")
+                cell[side][key] = value
+        if not any(cell["compression"].values()) and not any(cell["tension"].values()):
+            raise ValueError(f"'{name}': no coefficients")
+        return cell
+
+    def _has_identical_load_cell(self, cell: dict) -> bool:
+        existing = self._find_load_cell(cell["name"])
+        if existing is None:
+            return False
+        try:
+            return self._normalize_load_cell(existing) == cell
+        except (ValueError, TypeError):
+            return False   # an incomplete cell here can't be identical
+
+    def _marked_import_copy(self, cell: dict) -> Optional[dict]:
+        """'<name> (IMPORTED - DIFFERENT)', or '... DIFFERENT 2)' etc. if that
+        name is taken by something else. None if an identical marked copy is
+        already here."""
+        n = 1
+        while True:
+            suffix = " (IMPORTED - DIFFERENT)" if n == 1 else f" (IMPORTED - DIFFERENT {n})"
+            candidate = dict(cell, name=cell["name"] + suffix)
+            if self._find_load_cell(candidate["name"]) is None:
+                return candidate
+            if self._has_identical_load_cell(candidate):
+                return None
+            n += 1
+
+    def _import_load_cells(self):
+        """Add load cells from an exported file. Cells already here with the
+        same name and identical numbers are skipped; a cell with the same name
+        but different numbers is added as '<name> (IMPORTED - DIFFERENT)', so
+        existing calibration coefficients are never overwritten."""
+        path = filedialog.askopenfilename(
+            title="Import load cells",
+            filetypes=[("Load cell file", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Import failed", f"Couldn't read that file as a load cell file.\n\n{exc}")
+            return
+        if isinstance(data, dict):
+            data = data.get("load_cells", [data])
+        if not isinstance(data, list):
+            messagebox.showerror("Import failed", "That file doesn't contain load cells.")
+            return
+        cells, problems = [], []
+        for raw in data:
+            try:
+                cells.append(self._normalize_load_cell(raw))
+            except (ValueError, TypeError) as exc:
+                problems.append(str(exc))
+        if not cells:
+            messagebox.showerror("Import failed", "No valid load cells found."
+                                 + ("\n\n" + "\n".join(problems[:5]) if problems else ""))
+            return
+
+        new, same, renamed = [], [], []
+        for cell in cells:
+            if self._has_identical_load_cell(cell):
+                same.append(cell)
+            elif self._find_load_cell(cell["name"]) is None:
+                self.load_cells.append(cell)
+                new.append(cell)
+            else:
+                # Same name, different numbers: never overwrite calibration
+                # coefficients. Add it alongside as a clearly marked copy.
+                marked = self._marked_import_copy(cell)
+                if marked is None:
+                    same.append(cell)          # that exact copy was imported before
+                else:
+                    self.load_cells.append(marked)
+                    renamed.append(marked)
+
+        save_load_cells(self.load_cells)
+        changed = new + renamed
+        if changed:
+            self.editor_select_var.set(changed[0]["name"])
+        self._sync_load_cell_controls()
+
+        lines = [f"Added {len(new)} new load cell{'s' if len(new) != 1 else ''}."]
+        if renamed:
+            lines.append(f"{len(renamed)} had the same name as one of yours but different numbers, so "
+                         f"{'it was' if len(renamed) == 1 else 'they were'} added as a separate copy "
+                         "(yours is unchanged):")
+            lines += [f"  • {c['name']}" for c in renamed[:8]]
+        if same:
+            lines.append(f"Skipped {len(same)} already here (identical).")
+        if problems:
+            lines.append(f"Ignored {len(problems)} invalid entr{'ies' if len(problems) != 1 else 'y'}: "
+                         + "; ".join(problems[:3]))
+        messagebox.showinfo("Import complete", "\n".join(lines))
 
     def _prune_buffers(self, now_pc: Optional[float] = None):
         if now_pc is None:
@@ -2395,8 +3306,37 @@ class App(tk.Tk):
         while self.hadi_buffer and self.hadi_buffer[0].pc_time < cutoff:
             self.hadi_buffer.popleft()
         with self.ocr_lock:
-            while self.ocr_buffer and self.ocr_buffer[0].pc_time < cutoff:
-                self.ocr_buffer.popleft()
+            self._prune_ocr_buffer_locked(now_pc)
+
+    def _prune_ocr_buffer_locked(self, now_pc: float):
+        """Drop expired OCR samples. Caller must hold ocr_lock."""
+        cutoff = now_pc - self.buffer_keep_seconds
+        while self.ocr_buffer and self.ocr_buffer[0].pc_time < cutoff:
+            self.ocr_buffer.popleft()
+
+    def _on_decimal_point_change(self):
+        mode = self.decimal_point_var.get()
+        self.decimal_fixer.mode = mode
+        save_decimal_point_mode(mode)
+
+    def _refresh_decimal_point_hadi(self):
+        """Snapshot the HADI force for Auto decimal placement (Tk thread).
+
+        None when there's nothing trustworthy to match against: no HADI, no
+        cell selected, or load under 1% of the cell's capacity, where a small
+        offset becomes a huge ratio and the remembered decimals do better.
+        """
+        reading = self.latest_hadi
+        if (reading is None or not self.hadi.is_connected()
+                or not self.selected_load_cell_name.get()):
+            self._dp_hadi = None
+            return
+        capacity_lbf = self._capacity_limit_lbf()
+        if capacity_lbf is not None and abs(reading.force_lbf) < 0.01 * capacity_lbf:
+            self._dp_hadi = None
+            return
+        force = self._hadi_lbf_to_display(reading.force_lbf, raw_response=reading.raw_response)
+        self._dp_hadi = (force, reading.pc_time)
 
     def _on_ocr_reading(self, reading):
         now_pc = time.perf_counter()
@@ -2404,19 +3344,37 @@ class App(tk.Tk):
         # arrival time (iPhone UDP). This aligns the OCR reading with when
         # the display was actually photographed, not when OCR finished.
         effective_pc = getattr(reading, "capture_pc", None) or now_pc
+        raw_text = getattr(reading, "raw_text", "") or f"{reading.value:g}"
+        value = reading.value
+        # Restore a decimal point the OCR missed (Settings -> Decimal point).
+        # Everything downstream — live display, capture median, % error,
+        # CSV — sees the fixed-up text and value.
+        hadi = self._dp_hadi
+        hadi_force = hadi[0] if hadi and (now_pc - hadi[1]) <= 2.0 else None
+        fixed_text = self.decimal_fixer.fix(raw_text, hadi_force)
+        if fixed_text != raw_text:
+            try:
+                value = float(fixed_text)
+                raw_text = fixed_text
+            except ValueError:
+                pass
+        self._last_ocr_decimals = self._decimal_places(raw_text)
         sample = OCRTimedReading(
-            value=reading.value,
+            value=value,
             pc_time=effective_pc,
             wall_time=reading.received_at,
             phone_time=reading.timestamp,
-            raw_text=getattr(reading, "raw_text", "") or f"{reading.value:g}",
+            raw_text=raw_text,
         )
         with self.ocr_lock:
             self.latest_ocr = sample
             self.ocr_buffer.append(sample)
+            # Prune only the OCR buffer here: this runs on the OCR thread, and
+            # popping from hadi_buffer while the Tk thread iterates it raised
+            # "deque mutated during iteration", silently aborting UI ticks.
+            self._prune_ocr_buffer_locked(now_pc)
         self.ocr_last_pc_time = now_pc
         self._ocr_last_packet_pc = now_pc
-        self._prune_buffers(now_pc)
 
     def _on_gps_fix(self, gps):
         self._ocr_last_packet_pc = time.perf_counter()
@@ -2449,45 +3407,162 @@ class App(tk.Tk):
         if self.locked_gps is None:
             self.locked_gps = fix
 
-        locked = self.locked_gps
-        self.gps_status_var.set(
-            f"Gravity locked | MF {locked.gravity_factor:.7f}"
-        )
-        self.w_button_var.set(f"SELECT / UNSELECT W    MF {locked.gravity_factor:.7f}")
+        self._refresh_gravity_status()
+
+    def _refresh_gravity_status(self):
+        ctx = self._gravity_context()
+        mf = ctx["gravity_factor"]
+        if ctx["source"] == "standard":
+            self.gps_status_var.set("No location — W rows use standard gravity (MF 1.0)")
+            # Always show the MF, so a forgotten location is obvious before
+            # any weight rows are made.
+            self.w_button_var.set(f"SELECT / UNSELECT W    MF {mf:.7f} (standard)")
+            return
+        self.gps_status_var.set(f"{ctx['note']} | MF {mf:.7f}")
+        self.w_button_var.set(f"SELECT / UNSELECT W    MF {mf:.7f}")
+
+    def _set_mf_row_visible(self, visible: bool):
+        if visible == self._mf_row_visible:
+            return
+        self._mf_row_visible = visible
+        for w in self._mf_row_widgets:
+            if visible:
+                w.grid()
+            else:
+                w.grid_remove()
+        self._mf_link.configure(text="Hide MF override" if visible else "Enter MF directly")
+
+    def _toggle_mf_row(self):
+        # An active override always stays on screen so it can't be forgotten.
+        if self._mf_row_visible and self._mf_override is not None:
+            self.gps_status_var.set("Clear the MF override and press Apply before hiding it")
+            self.after(3000, self._refresh_gravity_status)
+            return
+        self._set_mf_row_visible(not self._mf_row_visible)
+        if self._mf_row_visible:
+            self._mf_row_widgets[1].focus_set()
 
     def _apply_mf_override(self):
         raw = self.mf_override_var.get().strip()
-        if not raw:
-            self._mf_override = None
-            self.gps_status_var.set("MF override cleared — using GPS (or 1.0 if no GPS)")
-            self.w_button_var.set("SELECT / UNSELECT W")
-            return
-        try:
-            val = float(raw)
-        except ValueError:
-            self.gps_status_var.set("Invalid MF value — enter a number or leave blank")
-            return
-        self._mf_override = val
-        self.gps_status_var.set(f"MF override active | MF {val:.7f}")
-        self.w_button_var.set(f"SELECT / UNSELECT W    MF {val:.7f}")
+        if raw:
+            try:
+                new_override = float(raw)
+            except ValueError:
+                self.gps_status_var.set("Invalid MF value — enter a number or leave blank")
+                return
+        else:
+            new_override = None
+        prev_override, prev_text = self._mf_override, self._mf_override_applied_text
 
-    @staticmethod
-    def _interp_at(times, values, t):
-        """Linear interpolation over parallel (sorted times, values) lists.
+        def apply():
+            self._mf_override = new_override
 
-        Bisect-based so the sync-lag search stays cheap: it evaluates this
-        thousands of times per estimator tick on the UI thread.
+        def revert():
+            self._mf_override = prev_override
+            self.mf_override_var.set(prev_text)
+
+        if not self._commit_gravity_change(apply, revert):
+            return
+        self._mf_override_applied_text = raw
+        if new_override is not None:
+            self._set_mf_row_visible(True)
+
+    def _apply_location(self):
+        # Session-only, like the MF override: every launch starts from
+        # standard gravity rather than wherever the last session was.
+        lat_raw = self.loc_lat_var.get().strip()
+        elev_raw = self.loc_elev_var.get().strip()
+        unit = self.loc_elev_unit_var.get()
+        if not lat_raw and not elev_raw:
+            new_location = None
+        else:
+            try:
+                lat = float(lat_raw)
+                elev = float(elev_raw) if elev_raw else 0.0
+                if not -90.0 <= lat <= 90.0:
+                    raise ValueError
+            except ValueError:
+                self.gps_status_var.set("Invalid location — latitude must be −90 to 90 and elevation a number")
+                return
+            altitude_m = elev * 0.3048 if unit == "ft" else elev
+            mf = astm_multiplying_factor(lat, altitude_m)
+            new_location = {
+                "latitude": lat,
+                "altitude_m": altitude_m,
+                "elevation_text": f"{elev:g} {unit}",
+                "gravity_factor": mf,
+                "gravity_m_s2": mf * STANDARD_GRAVITY,
+            }
+        prev_location, prev_text = self._manual_location, self._location_applied_text
+
+        def apply():
+            self._manual_location = new_location
+
+        def revert():
+            self._manual_location = prev_location
+            self.loc_lat_var.set(prev_text[0])
+            self.loc_elev_var.set(prev_text[1])
+            self.loc_elev_unit_var.set(prev_text[2])
+
+        if self._commit_gravity_change(apply, revert):
+            self._location_applied_text = (lat_raw, elev_raw, unit)
+
+    def _commit_gravity_change(self, apply, revert) -> bool:
+        """Apply a location/MF change; if existing W rows were made with a
+        different MF, ask what to do with them. Returns False if cancelled.
+
+        A W row's reference force is nominal weight x the MF in effect when
+        the row was made, so correcting the location afterwards used to leave
+        those rows silently on the old MF while new rows used the new one.
         """
-        if len(times) < 2 or t < times[0] or t > times[-1]:
-            return None
-        i = bisect.bisect_left(times, t)
-        if i == 0:
-            return values[0]
-        span = times[i] - times[i - 1]
-        if span <= 0:
-            return values[i]
-        f = (t - times[i - 1]) / span
-        return values[i - 1] + (values[i] - values[i - 1]) * f
+        apply()
+        ctx = self._gravity_context()
+        new_mf = ctx["gravity_factor"]
+        stale = []
+        for point_row in self.capture_rows:
+            for run_key in ("run1", "run2"):
+                row = point_row.get(run_key)
+                if (row and row.get("nominal_weight_lbf") not in (None, "")
+                        and row.get("gravity_factor") not in (None, "")
+                        and abs(float(row["gravity_factor"]) - new_mf) > 1e-12):
+                    stale.append(row)
+        if stale:
+            old = sorted({f"{float(r['gravity_factor']):.7f}" for r in stale})
+            n = len(stale)
+            choice = messagebox.askyesnocancel(
+                "Gravity changed",
+                f"{n} W row{'s' if n != 1 else ''} use{'s' if n == 1 else ''} MF {', '.join(old)}. "
+                f"The new MF is {new_mf:.7f}.\n\n"
+                f"Yes — update {'those rows' if n != 1 else 'that row'} to the new MF "
+                f"(OCR readings kept, % error recalculated)\n"
+                f"No — keep {'them' if n != 1 else 'it'} as {'they are' if n != 1 else 'it is'}; "
+                f"only new W rows use the new MF\n"
+                f"Cancel — don't change the gravity setting",
+            )
+            if choice is None:
+                revert()
+                self._refresh_gravity_status()
+                return False
+            if choice:
+                for row in stale:
+                    self._update_weight_row_gravity(row, ctx)
+                self._redraw_point_table()
+                self._mark_data_changed()
+        self._refresh_gravity_status()
+        return True
+
+    def _update_weight_row_gravity(self, row: dict, ctx: dict) -> None:
+        """Re-base a W row on a new MF, keeping its weight and OCR reading."""
+        mf = ctx["gravity_factor"]
+        row["gravity_factor"] = mf
+        row["gravity_m_s2"] = ctx["gravity_m_s2"]
+        row["gps_latitude"] = ctx["gps_latitude"]
+        row["gps_longitude"] = ctx["gps_longitude"]
+        row["gps_altitude_m"] = ctx.get("gps_altitude_m", "")
+        row["hadi_lbf"] = float(row["nominal_weight_lbf"]) * mf
+        self._set_row_hadi_text(row)
+        if row.get("ocr") not in (None, ""):
+            self._recalculate_row_error(row)
 
     @staticmethod
     def _interp(samples, t, attr):
@@ -2519,16 +3594,16 @@ class App(tk.Tk):
 
     @staticmethod
     def _corr(xs, ys):
-        n = len(xs)
-        if n < 8:
+        """Pearson correlation of two equal-length numpy arrays."""
+        if len(xs) < 8:
             return None
-        mx = sum(xs) / n
-        my = sum(ys) / n
-        vx = sum((x - mx) ** 2 for x in xs)
-        vy = sum((y - my) ** 2 for y in ys)
+        dx = xs - xs.mean()
+        dy = ys - ys.mean()
+        vx = float(dx @ dx)
+        vy = float(dy @ dy)
         if vx <= 1e-9 or vy <= 1e-9:
             return None
-        return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / ((vx * vy) ** 0.5)
+        return float(dx @ dy) / (vx * vy) ** 0.5
 
     def _estimate_sync_lag(self):
         now_pc = time.perf_counter()
@@ -2542,8 +3617,7 @@ class App(tk.Tk):
             ocr = list(self.ocr_buffer)
 
         if len(hadi) < 12 or len(ocr) < 12:
-            cal_note = f" | cal {self.calibration_lag_seconds*1000:+.0f}" if self.calibration_lag_seconds > 0 else ""
-            self.sync_status_var.set(f"Sync: waiting for data | lag {self.sync_lag_seconds*1000:+.0f} ms{cal_note}")
+            self.sync_status_var.set(f"Sync: waiting for data | lag {self.sync_lag_seconds*1000:+.0f} ms")
             return
 
         # Use recent data only.
@@ -2553,34 +3627,36 @@ class App(tk.Tk):
         if len(hadi) < 8 or len(ocr) < 8:
             return
 
-        # Need enough actual movement; otherwise any lag estimate is meaningless.
+        # Both signals must actually change, or there's nothing to line up.
+        # This used to demand a 5 lbf swing, which steady-load calibration
+        # (and any small cell) never produces, so the lag was never measured.
+        # Any variation works — even at-rest flicker of a count or two locks
+        # on (corr ~0.97 in testing) — and the correlation threshold below
+        # rejects windows where the two don't genuinely track each other.
         h_vals = [s.force_lbf for s in hadi]
         o_vals = [s.value for s in ocr]
-        if (max(h_vals) - min(h_vals)) < 5 or (max(o_vals) - min(o_vals)) < 5:
-            cal_note = f" | cal {self.calibration_lag_seconds*1000:+.0f}" if self.calibration_lag_seconds > 0 else ""
-            self.sync_status_var.set(f"Sync: steady load | lag {self.sync_lag_seconds*1000:+.0f} ms{cal_note}")
+        if max(h_vals) == min(h_vals) or max(o_vals) == min(o_vals):
+            self.sync_status_var.set(f"Sync: no change to track | lag {self.sync_lag_seconds*1000:+.0f} ms")
             return
 
         best_lag = None
         best_corr = -2.0
 
-        # When calibration is set, search a narrow window around it with
-        # finer steps.  Otherwise scan the full ±500 ms range.
-        # The calibration anchor was measured for the iPhone pipeline; in
-        # webcam mode the camera latency is the starting point instead, so
-        # ignore the anchor and refine around the current lag.
-        cal = 0.0 if self.webcam_ocr else self.calibration_lag_seconds
-        if cal > 0:
-            center_ms = int(round(cal * 1000.0))
-            search_range = range(center_ms - 200, center_ms + 201, 10)
-        elif self.webcam_ocr:
+        # Webcam: refine around the current lag (seeded from Cam Latency).
+        # Otherwise scan the full ±500 ms range.
+        if self.webcam_ocr:
             center_ms = int(round(self.sync_lag_seconds * 1000.0))
             search_range = range(center_ms - 250, center_ms + 251, 10)
         else:
             search_range = range(-500, 501, 25)
 
-        hadi_t = [s.pc_time for s in hadi]
-        ocr_t = [s.pc_time for s in ocr]
+        # Vectorised: this runs once a second on the Tk thread, and the
+        # pure-Python version took 30-40 ms per run while the load moved —
+        # a visible stutter every second. numpy does it in about a millisecond.
+        hadi_t = np.fromiter((s.pc_time for s in hadi), float)
+        ocr_t = np.fromiter((s.pc_time for s in ocr), float)
+        h_arr = np.asarray(h_vals, float)
+        o_arr = np.asarray(o_vals, float)
 
         for lag_ms in search_range:
             lag = lag_ms / 1000.0
@@ -2589,89 +3665,98 @@ class App(tk.Tk):
             if t1 - t0 < 1.0:
                 continue
 
-            xs = []
-            ys = []
-            t = t0
-            while t <= t1:
-                hv = self._interp_at(hadi_t, h_vals, t)
-                ov = self._interp_at(ocr_t, o_vals, t + lag)
-                if hv is not None and ov is not None:
-                    xs.append(hv)
-                    ys.append(ov)
-                t += 0.05
-
+            grid = np.arange(t0, t1 + 1e-9, 0.05)
+            xs = np.interp(grid, hadi_t, h_arr)
+            ys = np.interp(grid + lag, ocr_t, o_arr)
             c = self._corr(xs, ys)
             if c is not None and c > best_corr:
                 best_corr = c
                 best_lag = lag
 
         if best_lag is None:
-            if cal > 0:
-                self.sync_lag_seconds = 0.95 * self.sync_lag_seconds + 0.05 * cal
-                self.sync_status_var.set(
-                    f"Cal anchor {cal*1000:+.0f} ms | lag {self.sync_lag_seconds*1000:+.0f} ms (drifting to cal)")
             return
 
-        if best_corr >= 0.65:
-            self.sync_lag_seconds = 0.80 * self.sync_lag_seconds + 0.20 * best_lag
-            if cal > 0:
-                self.sync_lag_seconds = 0.95 * self.sync_lag_seconds + 0.05 * cal
+        if best_corr >= 0.65 and self._lag_estimate_plausible(best_lag):
+            # Converge quickly while far off, then settle: once within 20 ms,
+            # take only small corrections so the per-second estimate noise
+            # (about ±7 ms in testing) doesn't move the pairing between
+            # captures. Settled lag ended up 2-3x steadier with no loss of
+            # capture accuracy in replays of 600 real captures.
+            diff = best_lag - self.sync_lag_seconds
+            weight = 0.20 if abs(diff) > 0.020 else 0.05
+            self.sync_lag_seconds += weight * diff
             self.sync_confidence = best_corr
-            # Persist at most every 10 s (or on a >2 ms change) instead of every
-            # estimator tick — this runs once a second and was rewriting the
-            # file constantly for sub-millisecond drift.
+            # Persist at most every 10 s. This runs once a second on the Tk
+            # thread, and while the lag is converging it drifts by more than a
+            # couple of ms each tick, so a change-triggered save meant a file
+            # write (and a possible disk/antivirus hiccup) every second.
             last_saved = getattr(self, "_last_sync_save", None)
             lag_ms = self.sync_lag_seconds * 1000.0
-            if (last_saved is None
-                    or now_pc - last_saved[0] >= 10.0
-                    or abs(lag_ms - last_saved[1]) > 2.0):
-                # Preserve the stored (iPhone) calibration anchor even while
-                # webcam mode estimates with the anchor disabled.
-                save_sync_state(lag_ms, self.sync_confidence,
-                                calibration_lag_ms=self.calibration_lag_seconds * 1000.0)
+            if last_saved is None or now_pc - last_saved[0] >= 10.0:
+                save_sync_state(lag_ms, self.sync_confidence)
                 self._last_sync_save = (now_pc, lag_ms)
 
-        cal_note = f" | cal {cal*1000:+.0f}" if cal > 0 else ""
         self.sync_status_var.set(
-            f"Sync lag {self.sync_lag_seconds*1000:+.0f} ms | conf {self.sync_confidence:.2f}{cal_note}"
+            f"Sync lag {self.sync_lag_seconds*1000:+.0f} ms | conf {self.sync_confidence:.2f}"
+            + (" | ignoring an outlier" if self._lag_jump_candidates else "")
         )
 
-    def _apply_calibration_lag(self):
-        raw = self.cal_lag_ms_var.get().strip()
-        if not raw:
-            self.calibration_lag_seconds = 0.0
-            save_sync_state(self.sync_lag_seconds * 1000.0, self.sync_confidence,
-                            calibration_lag_ms=0.0)
-            self.sync_status_var.set(f"Calibration cleared | lag {self.sync_lag_seconds*1000:+.0f} ms")
-            return
-        try:
-            cal_ms = float(raw)
-        except ValueError:
-            return
-        self.calibration_lag_seconds = cal_ms / 1000.0
-        self.sync_lag_seconds = self.calibration_lag_seconds
-        self.sync_confidence = 0.0
-        save_sync_state(self.sync_lag_seconds * 1000.0, self.sync_confidence,
-                        calibration_lag_ms=cal_ms)
-        self.sync_status_var.set(f"Cal {cal_ms:+.0f} ms applied | auto sync will refine from here")
+    # A webcam frame can't arrive before the display shows it, and even slow
+    # USB/4K cameras measure well under this. Estimates outside are glitches.
+    WEBCAM_LAG_LIMITS = (0.0, 0.8)
+    # Once settled, an estimate this far from the current lag must be
+    # repeated (3 in a row, agreeing within 30 ms) before it's believed.
+    LAG_JUMP_SECONDS = 0.060
+    LAG_JUMP_CONFIRMATIONS = 3
+
+    def _lag_estimate_plausible(self, best_lag: float) -> bool:
+        """Reject lag estimates a glitch could produce (a camera stalling or
+        delivering a burst of stale frames for a moment), while still letting
+        a genuine, persistent change through after a few seconds."""
+        if self.webcam_ocr:
+            lo, hi = self.WEBCAM_LAG_LIMITS
+            if not lo <= best_lag <= hi:
+                return False
+        diff = abs(best_lag - self.sync_lag_seconds)
+        if not self._lag_settled or diff <= self.LAG_JUMP_SECONDS:
+            self._lag_jump_candidates = []
+            # Settled = 5 estimates in a row within 20 ms of the current lag.
+            self._lag_good_streak = self._lag_good_streak + 1 if diff <= 0.020 else 0
+            if self._lag_good_streak >= 5:
+                self._lag_settled = True
+            return True
+        # Settled and this estimate jumps: hold it until it repeats.
+        cands = self._lag_jump_candidates
+        if cands and abs(best_lag - cands[-1]) > 0.030:
+            cands.clear()
+        cands.append(best_lag)
+        if len(cands) < self.LAG_JUMP_CONFIRMATIONS:
+            return False
+        # Real change: follow it at the fast rate and re-settle from there.
+        self._lag_jump_candidates = []
+        self._lag_settled = False
+        self._lag_good_streak = 0
+        return True
+
+    def _reset_lag_tracking(self):
+        self._lag_settled = False
+        self._lag_good_streak = 0
+        self._lag_jump_candidates: list[float] = []
 
     def _corrected_ocr_time(self, sample):
         return sample.pc_time - self.sync_lag_seconds
 
-    def _median_near_time(self, samples, target_time, attr, corrected_ocr=False):
-        half = self.capture_median_half_window
-        vals = []
-        for s in samples:
-            t = self._corrected_ocr_time(s) if corrected_ocr else s.pc_time
-            if abs(t - target_time) <= half:
-                vals.append(getattr(s, attr))
-        if vals:
-            return statistics.median(vals), len(vals)
-        if not samples:
-            return None, 0
-        # fallback: nearest in time
-        nearest = min(samples, key=lambda s: abs((self._corrected_ocr_time(s) if corrected_ocr else s.pc_time) - target_time))
-        return getattr(nearest, attr), 1
+    @staticmethod
+    def _middle_sample(samples, attr):
+        """The real sample at the median of `attr` (lower middle when even).
+
+        statistics.median averages the two middle values of an even count,
+        recording a number neither instrument ever showed (0.02318 and
+        0.04637 -> 0.03478). Picking an actual sample also keeps a HADI
+        reading's force and raw mV/V from the same poll.
+        """
+        ordered = sorted(samples, key=lambda s: getattr(s, attr))
+        return ordered[(len(ordered) - 1) // 2]
 
     def _hadi_is_fresh(self, now_pc=None) -> bool:
         if now_pc is None:
@@ -2694,20 +3779,49 @@ class App(tk.Tk):
         with self.ocr_lock:
             self.latest_ocr = None
         self.ocr_value_var.set("---")
-        self._ocr_overload = False
-        self._ocr_overload_text = ""
 
     def _ui_tick(self):
         # This loop drives every live display update. If an exception ever
         # escaped it, the `after` reschedule would never run and the whole UI
         # would freeze permanently, so the body is guarded and the reschedule
         # is in a finally block.
+        self._ui_heartbeat = time.perf_counter()
         try:
             self._ui_tick_body()
-        except Exception:
-            pass
+            self._last_tick_error = None  # recovered; log it again if it recurs
+        except Exception as exc:
+            # Log each distinct failure once per streak, not 20x a second.
+            msg = f"{type(exc).__name__}: {exc}"
+            if msg != self._last_tick_error:
+                self._last_tick_error = msg
+                log_freeze(f"UI tick error: {msg}\n{traceback.format_exc()}")
         finally:
             self.after(50, self._ui_tick)
+
+    def _start_freeze_watchdog(self):
+        """Log the Tk thread's stack whenever it stops ticking for >0.5 s.
+
+        The busy cursor / yellow HADI light means the Tk thread is stuck in
+        something; this records exactly what, in freeze_log.txt.
+        """
+        main_id = threading.main_thread().ident
+
+        def watch():
+            stalled_from = None
+            while not getattr(self, "_closing", False):
+                time.sleep(0.1)
+                beat = self._ui_heartbeat
+                gap = time.perf_counter() - beat
+                if stalled_from is None and gap >= 0.5:
+                    stalled_from = beat
+                    frame = sys._current_frames().get(main_id)
+                    stack = "".join(traceback.format_stack(frame)) if frame else "(no frame)\n"
+                    log_freeze(f"UI STALLED (no tick for {gap * 1000:.0f} ms) — Tk thread is in:\n{stack}")
+                elif stalled_from is not None and beat != stalled_from:
+                    log_freeze(f"UI recovered after {(beat - stalled_from) * 1000:.0f} ms\n")
+                    stalled_from = None
+
+        threading.Thread(target=watch, daemon=True, name="FreezeWatchdog").start()
 
     def _ui_tick_body(self):
         now_pc = time.perf_counter()
@@ -2720,10 +3834,11 @@ class App(tk.Tk):
                 break
             if isinstance(item, Exception):
                 self.status_var.set(f"HADI error: {item}")
+                log_freeze(f"HADI error: {type(item).__name__}: {item}")
                 self.hadi_last_pc_time = None
                 self._set_hadi_waiting_display()
                 if self._auto_scan_active:
-                    self.hadi.disconnect()
+                    self.hadi.disconnect(wait=False)
                     self.hadi_button_var.set("Connect HADI")
                 continue
 
@@ -2742,6 +3857,7 @@ class App(tk.Tk):
 
         if not got_hadi and not self._hadi_is_fresh(now_pc):
             self._set_hadi_waiting_display()
+        self._refresh_decimal_point_hadi()
 
         if self.ocr or self.webcam_ocr:
             with self.ocr_lock:
@@ -2761,7 +3877,7 @@ class App(tk.Tk):
         self._update_hadi_light(now_pc)
         self._update_ocr_light(now_pc)
 
-        self._update_ocr_overload_warning()
+        self._update_device_overload()
         self._update_overload_badge()
         self._estimate_sync_lag()
         self._update_live_percent_error()
@@ -2986,7 +4102,8 @@ class App(tk.Tk):
                 _raw = run_row.get("hadi_raw")
                 _raw_f = float(_raw) if _raw not in (None, "") else None
                 display_val = self._hadi_lbf_to_display(float(run_row["hadi_lbf"]), raw_response=_raw_f)
-                hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False)
+                hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False,
+                                                       ocr_text=run_row.get("ocr_text"))
             except (TypeError, ValueError):
                 hadi_text = ""
         return (
@@ -3009,18 +4126,28 @@ class App(tk.Tk):
         except Exception:
             return ""
 
-    def _calculate_percent_error(self, ocr_value, hadi_value):
+    def _calculate_percent_error(self, ocr_value, hadi_value, ocr_text=None):
         """Return (percent_error, is_na).
 
         A zero OCR/reference value is still a valid capture value, but percent
         error cannot be computed because the denominator would be zero. Store it
-        as NA instead of rejecting the row.
+        as NA instead of rejecting the row. `ocr_text` is the OCR reading as
+        shown; it sets the HADI's displayed precision when Dec = Auto.
         """
         try:
             ocr = float(ocr_value)
             hadi = float(hadi_value)
         except Exception:
             return None, False
+        # Compare against the HADI value as shown (rounded to the Dec
+        # setting), not its full float precision — otherwise identical-looking
+        # rows report a nonzero error, which near zero load gets large. Never
+        # round coarser than the OCR reading itself, though: with Dec = 1 a
+        # 2.49925 lb reference would become 2 against a 2.50 reading.
+        if ocr_text in (None, ""):
+            ocr_text = repr(ocr) if "e" not in repr(ocr) else f"{ocr:.10f}"
+        ocr_decimals = self._decimal_places(ocr_text)
+        hadi = round(hadi, max(self._selected_hadi_decimals(ocr_text), ocr_decimals))
         if ocr == 0:
             return None, True
         return ((ocr - hadi) / ocr) * 100.0, False
@@ -3198,25 +4325,37 @@ class App(tk.Tk):
         run_row = self.capture_rows[row_index].get(f"run{run}") if row_index < len(self.capture_rows) else None
 
         current_value = ""
+        hadi_text = ""
         if run_row:
             if kind == "hadi":
-                # Prefer nominal weight if this row came from a manual/weight reference.
-                if run_row.get("nominal_weight_lbf") not in (None, ""):
-                    current_value = run_row.get("nominal_weight_lbf")
-                else:
-                    current_value = run_row.get("hadi_lbf", "")
+                # Stored values are lbf; the entry must show the selected display
+                # unit, because commit converts what was typed from that unit.
+                try:
+                    if run_row.get("nominal_weight_lbf") not in (None, ""):
+                        hadi_display = self._hadi_lbf_to_display(float(run_row["nominal_weight_lbf"]))
+                    elif run_row.get("hadi_lbf") not in (None, ""):
+                        _raw = run_row.get("hadi_raw")
+                        _raw_f = float(_raw) if _raw not in (None, "") else None
+                        hadi_display = self._hadi_lbf_to_display(float(run_row["hadi_lbf"]), raw_response=_raw_f)
+                    else:
+                        hadi_display = None
+                    if hadi_display is not None:
+                        hadi_text = self._format_hadi_lbf_text(hadi_display, show_plus=False,
+                                                               ocr_text=run_row.get("ocr_text"))
+                except (TypeError, ValueError):
+                    hadi_text = ""
             else:
                 current_value = run_row.get("ocr_text", run_row.get("ocr", ""))
 
         entry = ttk.Entry(tree)
-        if current_value != "":
+        if kind == "hadi":
+            entry.insert(0, hadi_text)
+        elif current_value != "":
             try:
-                if kind == "hadi":
-                    entry.insert(0, f"{float(current_value):g}")
-                else:
-                    entry.insert(0, self._format_ocr_text(current_value, run_row.get("ocr"), show_plus=False))
+                entry.insert(0, self._format_ocr_text(current_value, run_row.get("ocr"), show_plus=False))
             except Exception:
                 entry.insert(0, str(current_value).replace("+", ""))
+        self.edit_original_text = entry.get().strip()
         entry.select_range(0, "end")
         entry.place(x=x, y=y, width=w, height=h)
         entry.focus_force()
@@ -3268,6 +4407,7 @@ class App(tk.Tk):
         run = self.ocr_edit_run
         kind = self.edit_cell_kind or "ocr"
         raw = entry.get().strip().replace("+", "").replace("%", "")
+        unchanged = raw == self.edit_original_text.replace("+", "").replace("%", "")
 
         try:
             entry.destroy()
@@ -3292,7 +4432,12 @@ class App(tk.Tk):
         if row_index is None or run not in (1, 2) or not (0 <= row_index < len(self.capture_rows)):
             return "break"
 
-        if kind == "hadi":
+        if unchanged:
+            # Re-committing the displayed text would round the captured value
+            # to the shown decimals (and an OCR cell would lose its as-captured
+            # original and get flagged edited), so leave the row as captured.
+            pass
+        elif kind == "hadi":
             existing = self.capture_rows[row_index].get(f"run{run}") or {}
             was_weight = existing.get("nominal_weight_lbf") not in (None, "")
 
@@ -3301,15 +4446,17 @@ class App(tk.Tk):
                 # "turn W off". Keep the W marker, apply GPS gravity again,
                 # preserve OCR if it already exists, and recalc % error.
                 existing_ocr = existing.get("ocr")
+                nominal_lbf = self._display_to_lbf(new_value)
                 row = self._make_manual_weight_row(
-                    new_value,
+                    nominal_lbf,
                     ocr_value=existing_ocr if existing_ocr not in ("", None) else None,
                     ocr_text=existing.get("ocr_text", ""),
                 )
                 row["point"] = row_index + 1
                 row["run"] = run
-                row["pre_w_hadi_lbf"] = new_value
+                row["pre_w_hadi_lbf"] = nominal_lbf
                 row["ocr_edited"] = existing.get("ocr_edited", False)
+                self._carry_ocr_original(existing, row)
                 self.capture_rows[row_index][f"run{run}"] = row
             else:
                 existing.update({
@@ -3347,6 +4494,9 @@ class App(tk.Tk):
             run_row["ocr"] = new_value
             run_row["ocr_text"] = raw
             run_row["ocr_edited"] = True
+            # Typed in the current units, so this is the reading now.
+            for key in self._OCR_ORIGINAL_KEYS:
+                run_row.pop(key, None)
 
             try:
                 _raw = run_row.get("hadi_raw")
@@ -3356,7 +4506,7 @@ class App(tk.Tk):
                 hadi_value = None
 
             if hadi_value is not None:
-                err, is_na = self._calculate_percent_error(new_value, hadi_value)
+                err, is_na = self._calculate_percent_error(new_value, hadi_value, ocr_text=raw)
                 run_row["percent_error"] = err
                 run_row["percent_error_na"] = is_na
             else:
@@ -3493,7 +4643,8 @@ class App(tk.Tk):
                 _raw = run_row.get("hadi_raw")
                 _raw_f = float(_raw) if _raw not in (None, "") else None
                 display_val = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=_raw_f)
-                hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False)
+                hadi_text = self._format_hadi_lbf_text(display_val, show_plus=False,
+                                                       ocr_text=run_row.get("ocr_text"))
             except (TypeError, ValueError):
                 pass
         return [
@@ -3642,7 +4793,7 @@ class App(tk.Tk):
         except (TypeError, ValueError):
             hadi_raw_val = None
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw_val)
-        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display, ocr_text=ocr_text)
 
         run_row["time"] = datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds")
         run_row["load_cell"] = self.selected_load_cell_name.get()
@@ -3654,6 +4805,8 @@ class App(tk.Tk):
         run_row["target_delay_ms"] = ""
         run_row["ocr"] = ocr_value
         run_row["ocr_text"] = ocr_text
+        for key in self._OCR_ORIGINAL_KEYS:  # fresh reading in current units
+            run_row.pop(key, None)
         run_row["ocr_edited"] = False
         run_row["percent_error"] = percent_error
         run_row["percent_error_na"] = percent_error_na
@@ -3729,6 +4882,7 @@ class App(tk.Tk):
             hadi_raw = self.latest_hadi.raw_response if self.latest_hadi else None
             with self.ocr_lock:
                 ocr = self.latest_ocr.value if self.latest_ocr else None
+                ocr_text = self.latest_ocr.raw_text if self.latest_ocr else None
             if hadi_lbf is None or ocr is None:
                 raise ValueError
             # Mirror the Flip ± toggle so the live % error matches what a
@@ -3736,7 +4890,7 @@ class App(tk.Tk):
             if self.flip_sign_var.get():
                 ocr = -ocr
             hadi = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
-            err, is_na = self._calculate_percent_error(ocr, hadi)
+            err, is_na = self._calculate_percent_error(ocr, hadi, ocr_text=ocr_text)
             if is_na:
                 self.live_error_var.set("NA")
                 self._set_live_error_color(None)
@@ -3808,8 +4962,21 @@ class App(tk.Tk):
                 "gps_latitude": "",
                 "gps_longitude": "",
                 "gps_altitude_m": "",
-                "note": f"manual MF override {mf:.7f}",
+                "note": "MF override",
                 "using_gps": False,
+                "source": "override",
+            }
+        loc = getattr(self, "_manual_location", None)
+        if loc is not None:
+            return {
+                "gravity_factor": loc["gravity_factor"],
+                "gravity_m_s2": loc["gravity_m_s2"],
+                "gps_latitude": loc["latitude"],
+                "gps_longitude": "",
+                "gps_altitude_m": loc["altitude_m"],
+                "note": f"Location {loc['latitude']:.4f}°, {loc['elevation_text']}",
+                "using_gps": True,
+                "source": "location",
             }
         gps = getattr(self, "locked_gps", None) if USE_GPS_GRAVITY_CORRECTION else None
         if gps is None:
@@ -3821,6 +4988,7 @@ class App(tk.Tk):
                 "gps_altitude_m": "",
                 "note": "standard gravity; GPS not required",
                 "using_gps": False,
+                "source": "standard",
             }
         return {
             "gravity_factor": gps.gravity_factor,
@@ -3829,11 +4997,12 @@ class App(tk.Tk):
             "gps_longitude": gps.longitude,
             "gps_altitude_m": gps.altitude_m if gps.altitude_m is not None else "",
             "note": (
-                f"ASTM MF {gps.gravity_factor:.7f}, alt {gps.altitude_m:.1f}m"
+                f"Gravity locked (GPS) {gps.latitude:.4f}°, {gps.altitude_m:.1f} m"
                 if gps.altitude_m is not None
-                else f"ASTM MF {gps.gravity_factor:.7f}, alt 0m"
+                else f"Gravity locked (GPS) {gps.latitude:.4f}°, alt 0 m"
             ),
             "using_gps": True,
+            "source": "gps",
         }
 
     def _current_target_ocr_value(self):
@@ -3853,7 +5022,7 @@ class App(tk.Tk):
         reference_lbf = nominal_weight_lbf * gravity_factor
 
         reference_display = self._hadi_lbf_to_display(reference_lbf)
-        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, reference_display)
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, reference_display, ocr_text=ocr_text)
 
         row = {
             "point": (self.capture_target_index + 1) if self.capture_target_index is not None else "",
@@ -3923,7 +5092,7 @@ class App(tk.Tk):
             hadi_display = self._hadi_lbf_to_display(float(hadi_lbf), raw_response=raw_val) if hadi_lbf not in (None, "") else None
         except (TypeError, ValueError):
             hadi_display = None
-        err, is_na = self._calculate_percent_error(row.get("ocr"), hadi_display)
+        err, is_na = self._calculate_percent_error(row.get("ocr"), hadi_display, ocr_text=row.get("ocr_text"))
         row["percent_error"] = err
         row["percent_error_na"] = is_na
 
@@ -3956,6 +5125,7 @@ class App(tk.Tk):
         row["point"] = index + 1
         row["run"] = run
         row["pre_w_hadi_lbf"] = original_hadi
+        self._carry_ocr_original(existing, row)
         self.capture_rows[index][f"run{run}"] = row
 
         tree = self._tree_for_run(run)
@@ -4099,14 +5269,13 @@ class App(tk.Tk):
         gravity_m_s2 = ctx["gravity_m_s2"]
         lat = ctx["gps_latitude"]
         lon = ctx["gps_longitude"]
-        gps_note = ctx["note"]
 
         conventional_lbf = hadi_lbf / gravity_factor if gravity_factor else hadi_lbf
         nominal_weight_lbf = nearest_standard_weight_lbf(conventional_lbf)
         reference_lbf = nominal_weight_lbf * gravity_factor
 
         reference_display = self._hadi_lbf_to_display(reference_lbf)
-        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, reference_display)
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, reference_display, ocr_text=ocr_text)
         target_delay_ms = (now_pc - target_t) * 1000.0
 
         row = {
@@ -4349,9 +5518,9 @@ class App(tk.Tk):
         if len(tight) < 3:
             tight = [(h, o) for _, h, o in pairs[:max(3, len(pairs))]]
 
-        hadi_lbf = statistics.median(h.force_lbf for h, _ in tight)
-        hadi_raw = statistics.median(h.raw_response for h, _ in tight)
-        ocr_value = statistics.median(o.value for _, o in tight)
+        mid_hadi = self._middle_sample([h for h, _ in tight], "force_lbf")
+        hadi_lbf, hadi_raw = mid_hadi.force_lbf, mid_hadi.raw_response
+        ocr_value = self._middle_sample([o for _, o in tight], "value").value
         ocr_decimals = max((self._decimal_places(o.raw_text) for _, o in tight), default=0)
         ocr_text = self._fixed_decimals(ocr_value, ocr_decimals)
 
@@ -4360,7 +5529,7 @@ class App(tk.Tk):
             ocr_text = self._fixed_decimals(ocr_value, self._decimal_places(ocr_text))
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
-        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display, ocr_text=ocr_text)
 
         row = {
             "point": idx + 1,
@@ -4420,7 +5589,11 @@ class App(tk.Tk):
         except ValueError:
             half_window = 0.5
         self._manual_median_press_time = time.perf_counter()
-        delay_ms = int(half_window * 1000)
+        # Camera frames arrive `sync_lag` after the moment they show, so the
+        # frames for the end of the window are still in flight at
+        # press + half_window. Wait for them (plus a little OCR time), or the
+        # window silently loses its last ~lag of camera samples.
+        delay_ms = int((half_window + max(0.0, self.sync_lag_seconds) + 0.05) * 1000)
         self.after(delay_ms, self._capture_manual_median)
         return "break"
 
@@ -4473,9 +5646,9 @@ class App(tk.Tk):
             tight = [(h, o) for _, h, o in pairs[:max(3, len(pairs))]]
 
         now_wall = time.time()
-        hadi_lbf = statistics.median(h.force_lbf for h, _ in tight)
-        hadi_raw = statistics.median(h.raw_response for h, _ in tight)
-        ocr_value = statistics.median(o.value for _, o in tight)
+        mid_hadi = self._middle_sample([h for h, _ in tight], "force_lbf")
+        hadi_lbf, hadi_raw = mid_hadi.force_lbf, mid_hadi.raw_response
+        ocr_value = self._middle_sample([o for _, o in tight], "value").value
         ocr_decimals = max((self._decimal_places(o.raw_text) for _, o in tight), default=0)
         ocr_text = self._fixed_decimals(ocr_value, ocr_decimals)
 
@@ -4484,7 +5657,7 @@ class App(tk.Tk):
             ocr_text = self._fixed_decimals(ocr_value, self._decimal_places(ocr_text))
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw)
-        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display, ocr_text=ocr_text)
 
         self.status_var.set(
             f"Capture: {len(tight)} pairs (gap<={threshold*1000:.0f}ms) | "
@@ -4548,7 +5721,7 @@ class App(tk.Tk):
             ocr_text = self._fixed_decimals(ocr_value, self._decimal_places(ocr_text))
 
         hadi_display = self._hadi_lbf_to_display(hadi_lbf, raw_response=hadi_raw) if hadi_lbf is not None else None
-        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display)
+        percent_error, percent_error_na = self._calculate_percent_error(ocr_value, hadi_display, ocr_text=ocr_text)
         target_delay_ms = (now_pc - target_t) * 1000.0
 
         row = {
@@ -4646,6 +5819,7 @@ class App(tk.Tk):
                 if not self._save_csv():
                     return
 
+        self._closing = True  # shutdown stalls are expected; stop logging them
         self.hadi.disconnect()
         self._stop_ocr()
         self._stop_webcam_ocr()
